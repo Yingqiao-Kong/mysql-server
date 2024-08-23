@@ -718,6 +718,8 @@ static PSI_mutex_info all_innodb_mutexes[] = {
 #endif /* UNIV_DEBUG */
     PSI_MUTEX_KEY(rw_lock_list_mutex, 0, 0, PSI_DOCUMENT_ME),
     PSI_MUTEX_KEY(rw_lock_mutex, 0, 0, PSI_DOCUMENT_ME),
+    PSI_MUTEX_KEY(rw_trx_hash_element_mutex, 0, 0, PSI_DOCUMENT_ME),
+    PSI_MUTEX_KEY(read_view_mutex, 0, 0, PSI_DOCUMENT_ME),
     PSI_MUTEX_KEY(srv_innodb_monitor_mutex, 0, 0, PSI_DOCUMENT_ME),
     PSI_MUTEX_KEY(srv_misc_tmpfile_mutex, 0, 0, PSI_DOCUMENT_ME),
     PSI_MUTEX_KEY(srv_monitor_file_mutex, 0, 0, PSI_DOCUMENT_ME),
@@ -17704,8 +17706,9 @@ int ha_innobase::check(THD *thd,                /*!< in: user thread handle */
   /* We must run the index record counts at an isolation level
   >= READ COMMITTED, because a dirty read can see a wrong number
   of records in some index; to play safe, we use always
-  REPEATABLE READ here */
-  m_prebuilt->trx->isolation_level = TRX_ISO_REPEATABLE_READ;
+  REPEATABLE READ here (except when undo logs are unavailable) */
+  m_prebuilt->trx->isolation_level = high_level_read_only
+      ? TRX_ISO_READ_UNCOMMITTED : TRX_ISO_REPEATABLE_READ;
 
   ut_ad(!m_prebuilt->table->is_corrupted());
 
@@ -18072,6 +18075,11 @@ int ha_innobase::start_stmt(THD *thd, thr_lock_type lock_type) {
 
 trx_t::isolation_level_t innobase_trx_map_isolation_level(
     enum_tx_isolation iso) {
+  if (UNIV_UNLIKELY(srv_force_recovery >= SRV_FORCE_NO_UNDO_LOG_SCAN)
+      || UNIV_UNLIKELY(srv_read_only_mode)) {
+    return TRX_ISO_READ_UNCOMMITTED;
+  }
+
   trx_t::isolation_level_t trx_isolation_level;
 
   switch (iso) {
@@ -18364,12 +18372,8 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
       }
 
     } else if (trx->isolation_level <= TRX_ISO_READ_COMMITTED &&
-               MVCC::is_view_active(trx->read_view)) {
-      mutex_enter(&trx_sys->mutex);
-
-      trx_sys->mvcc->view_close(trx->read_view, true);
-
-      mutex_exit(&trx_sys->mutex);
+               trx->read_view->is_open()) {
+      trx->read_view->close();
     }
   }
 
@@ -18961,15 +18965,10 @@ THR_LOCK_DATA **ha_innobase::store_lock(
         innobase_trx_map_isolation_level(thd_get_trx_isolation(thd));
 
     if (trx->isolation_level <= TRX_ISO_READ_COMMITTED &&
-        MVCC::is_view_active(trx->read_view)) {
+        trx->read_view->is_open()) {
       /* At low transaction isolation levels we let
       each consistent read set its own snapshot */
-
-      mutex_enter(&trx_sys->mutex);
-
-      trx_sys->mvcc->view_close(trx->read_view, true);
-
-      mutex_exit(&trx_sys->mutex);
+      trx->read_view->close();
     }
   }
 
@@ -19898,6 +19897,21 @@ static void innodb_extend_and_initialize_update(THD *thd, SYS_VAR *var,
                       "innodb_extend_and_initialize");
   *static_cast<bool *>(var_ptr) = true;
 #endif /* !NO_FALLOCATE && UNIV_LINUX */
+}
+
+/** Gets current trx.
+This function may be called during InnoDB initialisation, when
+innodb_hton_ptr->slot is not yet set to meaningful value.
+*/
+trx_t *current_trx() {
+  THD *thd = current_thd;
+
+  if (likely(thd != nullptr) && innodb_hton_ptr->slot != HA_SLOT_UNDEF) {
+    trx_t *&trx = thd_to_trx(thd);
+    return (trx);
+  } else {
+    return (nullptr);
+  }
 }
 
 /** Update the system variable innodb_buffer_pool_size using the "saved"

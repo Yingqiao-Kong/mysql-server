@@ -122,10 +122,15 @@ extern "C" void *test_lf_alloc(void *arg) {
   return nullptr;
 }
 
+bool do_sum(void *num, void *acc) {
+  *(int *)acc += *(int *)num;
+  return 0;
+}
+
 const int N_TLH = 1000;
 extern "C" void *test_lf_hash(void *arg) {
   int m = (*(int *)arg) / (2 * N_TLH);
-  int32 x, y, z, sum = 0, ins = 0;
+  int32 x,y,z,sum = 0, ins = 0, scans = 0;
   LF_PINS *pins;
 
   if (with_my_thread_init) my_thread_init();
@@ -135,20 +140,28 @@ extern "C" void *test_lf_hash(void *arg) {
   for (x = ((int)(intptr)(&m)); m; m--) {
     int i;
     y = x;
+
     for (i = 0; i < N_TLH; i++) {
       x = (x * (m + i) + 0x87654321) & INT_MAX32;
       z = (x < 0) ? -x : x;
+
       if (lf_hash_insert(&lf_hash, pins, &z)) {
         sum += z;
         ins++;
+      } else {
+        int unused = 0;
+        lf_hash_iterate(&lf_hash, pins, do_sum, &unused);
+        scans++;
       }
     }
+
     for (i = 0; i < N_TLH; i++) {
       y = (y * (m + i) + 0x87654321) & INT_MAX32;
       z = (y < 0) ? -y : y;
       if (lf_hash_delete(&lf_hash, pins, (uchar *)&z, sizeof(z))) sum -= z;
     }
   }
+
   lf_hash_put_pins(pins);
 
   bad += sum;
@@ -173,7 +186,7 @@ void do_tests() {
   test_concurrently("lf_alloc (with my_thread_init)", test_lf_alloc,
                     N = THREADS, CYCLES);
   test_concurrently("lf_hash (with my_thread_init)", test_lf_hash, N = THREADS,
-                    CYCLES / 10);
+                    CYCLES);
 
   with_my_thread_init = 0;
   test_concurrently("lf_pinbox (without my_thread_init)", test_lf_pinbox,
@@ -181,7 +194,7 @@ void do_tests() {
   test_concurrently("lf_alloc (without my_thread_init)", test_lf_alloc,
                     N = THREADS, CYCLES);
   test_concurrently("lf_hash (without my_thread_init)", test_lf_hash,
-                    N = THREADS, CYCLES / 10);
+                    N = THREADS, CYCLES);
 
   lf_hash_destroy(&lf_hash);
   lf_alloc_destroy(&lf_allocator);

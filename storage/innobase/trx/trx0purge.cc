@@ -49,7 +49,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "my_inttypes.h"
 #include "os0thread.h"
 #include "que0que.h"
-#include "read0read.h"
 #include "row0purge.h"
 #include "row0upd.h"
 #include "srv0mon.h"
@@ -247,11 +246,9 @@ void trx_purge_sys_create(ulint n_purge_threads, purge_pq_t *purge_queue) {
 
   purge_sys->query = trx_purge_graph_build(purge_sys->trx, n_purge_threads);
 
-  new (&purge_sys->view) ReadView();
+  new (&purge_sys->view) ReadViewBase();
 
-  trx_sys->mvcc->clone_oldest_view(&purge_sys->view);
-
-  purge_sys->view_active = true;
+  purge_sys->clone_oldest_view();
 
   purge_sys->rseg_iter = UT_NEW_NOKEY(TrxUndoRsegsIterator(purge_sys));
 
@@ -271,8 +268,7 @@ void trx_purge_sys_close() {
 
   purge_sys->sess = nullptr;
 
-  purge_sys->view.close();
-  purge_sys->view.~ReadView();
+  purge_sys->view.~ReadViewBase();
 
   rw_lock_free(&purge_sys->latch);
   mutex_free(&purge_sys->pq_mutex);
@@ -349,8 +345,29 @@ void trx_purge_add_update_undo_to_history(
 
     ut_ad(undo->size == flst_get_len(seg_header + TRX_UNDO_PAGE_LIST));
 
+    byte *rseg_format = rseg_header + TRX_RSEG_FORMAT;
+
+    if (UNIV_UNLIKELY(mach_read_from_4(rseg_format))) {
+      mlog_write_ulint(rseg_format, 0, MLOG_4BYTES, mtr);
+
+      /* Clear also possible garbage at the end of
+      the page. Old InnoDB versions did not initialize
+      unused parts of pages. */
+      ut_ad(page_offset(rseg_header) == TRX_RSEG);
+
+      byte *b = rseg_header + TRX_RSEG_MAX_TRX_ID + 8;
+      ulint len = UNIV_PAGE_SIZE -
+          (FIL_PAGE_DATA_END + TRX_RSEG + TRX_RSEG_MAX_TRX_ID + 8);
+
+      memset(b, 0, len);
+      mlog_log_string(b, len, mtr);
+    }
+
     mlog_write_ulint(rseg_header + TRX_RSEG_HISTORY_SIZE,
                      hist_size + undo->size, MLOG_4BYTES, mtr);
+
+    mlog_write_ull(rseg_header + TRX_RSEG_MAX_TRX_ID,
+                   trx_sys->get_max_trx_id(), mtr);
   }
 
   /* Add the log as the first in the history list */
@@ -1581,10 +1598,8 @@ static bool trx_purge_truncate_marked_undo() {
 /** Removes unnecessary history data from rollback segments.
 NOTE that when this function is called, the caller must not
 have any latches on undo log pages!
-@param[in]  limit  Truncate limit
-@param[in]  view   Purge view */
-static void trx_purge_truncate_history(purge_iter_t *limit,
-                                       const ReadView *view) {
+@param[in]  limit  Truncate limit */
+static void trx_purge_truncate_history(purge_iter_t *limit) {
   MONITOR_INC_VALUE(MONITOR_PURGE_TRUNCATE_HISTORY_COUNT, 1);
 
   auto counter_time_truncate_history = ut_time_monotonic_us();
@@ -1592,13 +1607,13 @@ static void trx_purge_truncate_history(purge_iter_t *limit,
   /* We play safe and set the truncate limit at most to the purge view
   low_limit number, though this is not necessary */
 
-  if (limit->trx_no >= view->low_limit_no()) {
-    limit->trx_no = view->low_limit_no();
+  if (limit->trx_no >= purge_sys->low_limit_no()) {
+    limit->trx_no = purge_sys->low_limit_no();
     limit->undo_no = 0;
     limit->undo_rseg_space = SPACE_UNKNOWN;
   }
 
-  ut_ad(limit->trx_no <= purge_sys->view.low_limit_no());
+  ut_ad(limit->trx_no <= purge_sys->low_limit_no());
 
   /* Purge rollback segments in all undo tablespaces.  This may take
   some time and we do not want an undo DDL to attempt an x_lock during
@@ -1736,8 +1751,6 @@ static void trx_purge_rseg_get_next_history_log(
     rseg->unlatch();
 
 #ifdef UNIV_DEBUG
-    trx_sys_mutex_enter();
-
     /* Add debug code to track history list corruption reported
     on the MySQL mailing list on Nov 9, 2004. The fut0lst.cc
     file-based list was corrupt. The prev node pointer was
@@ -1760,8 +1773,6 @@ static void trx_purge_rseg_get_next_history_log(
       ib::info(ER_IB_MSG_1180) << "2. Try increasing the number of purge"
                                   " threads to expedite purging of undo logs.";
     }
-
-    trx_sys_mutex_exit();
 #endif
     return;
   }
@@ -1894,7 +1905,7 @@ static trx_undo_rec_t *trx_purge_get_next_rec(
   mtr_t mtr;
 
   ut_ad(purge_sys->next_stored);
-  ut_ad(purge_sys->iter.trx_no < purge_sys->view.low_limit_no());
+  ut_ad(purge_sys->iter.trx_no < purge_sys->low_limit_no());
 
   space = purge_sys->rseg->space_id;
   page_no = purge_sys->page_no;
@@ -2019,7 +2030,7 @@ static MY_ATTRIBUTE((warn_unused_result))
     }
   }
 
-  if (purge_sys->iter.trx_no >= purge_sys->view.low_limit_no()) {
+  if (purge_sys->iter.trx_no >= purge_sys->low_limit_no()) {
     return nullptr;
   }
 
@@ -2265,9 +2276,9 @@ static void trx_purge_truncate(void) {
   ut_ad(trx_purge_check_limit());
 
   if (purge_sys->limit.trx_no == 0) {
-    trx_purge_truncate_history(&purge_sys->iter, &purge_sys->view);
+    trx_purge_truncate_history(&purge_sys->iter);
   } else {
-    trx_purge_truncate_history(&purge_sys->limit, &purge_sys->view);
+    trx_purge_truncate_history(&purge_sys->limit);
   }
 
   /* Attempt to truncate an undo tablespace. */
@@ -2292,15 +2303,7 @@ ulint trx_purge(ulint n_purge_threads, /*!< in: number of purge tasks
   /* The number of tasks submitted should be completed. */
   ut_a(purge_sys->n_submitted == purge_sys->n_completed);
 
-  rw_lock_x_lock(&purge_sys->latch);
-
-  purge_sys->view_active = false;
-
-  trx_sys->mvcc->clone_oldest_view(&purge_sys->view);
-
-  purge_sys->view_active = true;
-
-  rw_lock_x_unlock(&purge_sys->latch);
+  purge_sys->clone_oldest_view();
 
 #ifdef UNIV_DEBUG
   if (srv_purge_view_update_only_debug) {

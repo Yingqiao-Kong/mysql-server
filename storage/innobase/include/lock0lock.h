@@ -688,7 +688,7 @@ bool lock_has_to_wait(const lock_t *lock1,  /*!< in: waiting lock */
 @param[in] rec User record
 @param[in] index Index
 @param[in] offsets Rec_get_offsets(rec, index)
-@param[in] max_trx_id Trx_sys_get_max_trx_id() */
+@param[in] max_trx_id trx_sys->get_max_trx_id() */
 void lock_report_trx_id_insanity(trx_id_t trx_id, const rec_t *rec,
                                  const dict_index_t *index,
                                  const ulint *offsets, trx_id_t max_trx_id);
@@ -834,16 +834,15 @@ void lock_trx_lock_list_init(
 
 /** Set the lock system timeout event. */
 void lock_set_timeout_event();
-#ifdef UNIV_DEBUG
+
 /** Checks that a transaction id is sensible, i.e., not in the future.
  @return true if ok */
 bool lock_check_trx_id_sanity(
     trx_id_t trx_id,           /*!< in: trx id */
     const rec_t *rec,          /*!< in: user record */
     const dict_index_t *index, /*!< in: index */
-    const ulint *offsets)      /*!< in: rec_get_offsets(rec, index) */
-    MY_ATTRIBUTE((warn_unused_result));
-
+    const ulint *offsets);     /*!< in: rec_get_offsets(rec, index) */
+#ifdef UNIV_DEBUG
 /** Check if the transaction holds an exclusive lock on a record.
 @param[in]  thr     query thread of the transaction
 @param[in]  table   table to check

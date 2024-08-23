@@ -248,13 +248,6 @@ class Latches {
   friend class Shard_naked_latch_guard;
   friend class Shard_naked_latches_guard;
 
-  /** You should not use this functionality in new code.
-  Instead use Global_exclusive_latch_guard.
-  This is intended only to be use within lock0* module, thus this class is only
-  accessible through lock0priv.h.
-  It is only used by lock_rec_fetch_page() as a workaround. */
-  friend class Unsafe_global_latch_manipulator;
-
   /** For some reason clang 6.0.0 and 7.0.0 (but not 8.0.0) fail at linking
   stage if we completely omit the destructor declaration, or use
 

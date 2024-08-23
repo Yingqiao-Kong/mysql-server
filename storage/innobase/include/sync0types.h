@@ -186,7 +186,7 @@ lock_sys->page_mutexes			Mutexes protecting lock_sys_t page
 |					lock queues
 |
 V
-trx_sys->mutex				Mutex protecting trx_sys_t
+trx_sys->mutex				Mutex protecting mysql_trx_list & gtid
 |
 V
 Threads mutex				Background thread scheduling mutex
@@ -276,6 +276,8 @@ enum latch_level_t {
   SYNC_THREADS,
   SYNC_TRX,
   SYNC_POOL,
+  SYNC_RW_TRX_HASH_ELEMENT,
+  SYNC_READ_VIEW,
   SYNC_POOL_MANAGER,
   SYNC_TRX_SYS,
   SYNC_LOCK_SYS_SHARDED,
@@ -468,6 +470,8 @@ enum latch_id_t {
   LATCH_ID_DBLR,
   LATCH_ID_REDO_LOG_ARCHIVE_ADMIN_MUTEX,
   LATCH_ID_REDO_LOG_ARCHIVE_QUEUE_MUTEX,
+  LATCH_ID_RW_TRX_HASH_ELEMENT,
+  LATCH_ID_READ_VIEW_MUTEX,
   LATCH_ID_TEST_MUTEX,
   LATCH_ID_MAX = LATCH_ID_TEST_MUTEX
 };

@@ -1628,7 +1628,7 @@ bool row_upd_changes_ord_field_binary_func(dict_index_t *index,
           /* The externally stored field
           was not written yet. This
           record should only be seen by
-          trx_rollback_or_clean_all_recovered(),
+          trx_recovery_rollback_thread(),
           when the server had crashed before
           storing the field. */
           ut_ad(thr == nullptr || thr->graph->trx->is_recovered);

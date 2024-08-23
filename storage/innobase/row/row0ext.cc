@@ -92,7 +92,7 @@ static void row_ext_cache_fill_func(const dict_index_t *index, row_ext_t *ext,
     } else {
       /* Fetch at most ext->max_len of the column.
       The column should be non-empty.  However,
-      trx_rollback_or_clean_all_recovered() may try to
+      trx_recovery_rollback_thread() may try to
       access a half-deleted BLOB if the server previously
       crashed during the execution of
       btr_free_externally_stored_field(). */

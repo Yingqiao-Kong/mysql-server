@@ -689,7 +689,7 @@ byte *btr_rec_copy_externally_stored_field_func(
   if (ref.is_null()) {
     /* The externally stored field was not written yet.
     This record should only be seen by
-    trx_rollback_or_clean_all_recovered() or any
+    trx_recovery_rollback_thread() or any
     TRX_ISO_READ_UNCOMMITTED transactions. */
 
     return (nullptr);

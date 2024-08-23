@@ -60,7 +60,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "pars0pars.h"
 #include "pars0sym.h"
 #include "que0que.h"
-#include "read0read.h"
 #include "record_buffer.h"
 #include "rem0cmp.h"
 #include "row0mysql.h"
@@ -132,7 +131,7 @@ static ibool row_sel_sec_rec_is_for_blob(
               field_ref_zero, BTR_EXTERN_FIELD_REF_SIZE)) {
     /* The externally stored field was not written yet.
     This record should only be seen by
-    trx_rollback_or_clean_all_recovered() or any
+    trx_recovery_rollback_thread() or any
     TRX_ISO_READ_UNCOMMITTED transactions. */
     return (FALSE);
   }
@@ -503,7 +502,7 @@ static void row_sel_fetch_columns(trx_t *trx, dict_index_t *index,
           /* This means that the externally stored field was not written yet.
           This record should only be seen by following situations:
            * Read uncommitted transactions (TRX_ISO_READ_UNCOMMITTED)
-           * During crash recovery [trx_rollback_or_clean_all_recovered().]
+           * During crash recovery [trx_recovery_rollback_thread().]
            * During lock-less consistent read, when the trx reads LOB even
              though the clust_rec is not to be seen. */
           ut_ad(allow_null_lob);
@@ -752,9 +751,9 @@ static void row_sel_build_committed_vers_for_mysql(
     prebuilt->old_vers_heap = mem_heap_create(rec_offs_size(*offsets));
   }
 
-  row_vers_build_for_semi_consistent_read(rec, mtr, clust_index, offsets,
-                                          offset_heap, prebuilt->old_vers_heap,
-                                          old_vers, vrow);
+  row_vers_build_for_semi_consistent_read(
+      prebuilt->trx, rec, mtr, clust_index, offsets, offset_heap,
+      prebuilt->old_vers_heap, old_vers, vrow);
 }
 
 /** Tests the conditions which determine when the index segment we are searching
@@ -2169,14 +2168,11 @@ que_thr_t *row_sel_step(que_thr_t *thr) /*!< in: query thread */
 
     if (node->consistent_read) {
       /* Assign a read view for the query */
-      trx_assign_read_view(thr_get_trx(thr));
+      trx_t *trx = thr_get_trx(thr);
+      trx_assign_read_view(trx);
 
-      if (thr_get_trx(thr)->read_view != nullptr) {
-        node->read_view = thr_get_trx(thr)->read_view;
-      } else {
-        node->read_view = nullptr;
-      }
-
+      node->read_view = trx->read_view->is_open() ?
+                        trx->read_view : nullptr;
     } else {
       sym_node_t *table_node;
       lock_mode i_lock_mode;
@@ -2859,7 +2855,7 @@ static MY_ATTRIBUTE((warn_unused_result)) bool row_sel_store_mysql_field_func(
     if (data == nullptr) {
       /* The externally stored field was not written
       yet. This record should only be seen by
-      trx_rollback_or_clean_all_recovered() or any
+      trx_recovery_rollback_thread() or any
       yet. This can happen after optimization which
       was done after for Bug#23481444 where we read
       last record in the page to find the end range
@@ -3356,7 +3352,7 @@ dberr_t Row_sel_get_clust_rec_for_mysql::operator()(
 
     if (trx->isolation_level > TRX_ISO_READ_UNCOMMITTED &&
         !lock_clust_rec_cons_read_sees(clust_rec, clust_index, *offsets,
-                                       trx_get_read_view(trx))) {
+                                       trx->read_view)) {
       if (clust_rec != cached_clust_rec) {
         /* The following call returns 'offsets' associated with 'old_vers' */
         err = row_sel_build_prev_vers_for_mysql(
@@ -3805,7 +3801,7 @@ static ulint row_sel_try_search_shortcut_for_mysql(
   *offsets = rec_get_offsets(rec, index, *offsets, ULINT_UNDEFINED, heap);
 
   if (!lock_clust_rec_cons_read_sees(rec, index, *offsets,
-                                     trx_get_read_view(trx))) {
+                                     trx->read_view)) {
     return (SEL_RETRY);
   }
 
@@ -4688,7 +4684,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
     if (trx->mysql_n_tables_locked == 0 && !prebuilt->ins_sel_stmt &&
         prebuilt->select_lock_type == LOCK_NONE &&
         trx->isolation_level > TRX_ISO_READ_UNCOMMITTED &&
-        MVCC::is_view_active(trx->read_view)) {
+        trx->read_view->is_open()) {
       /* This is a SELECT query done as a consistent read,
       and the read view has already been allocated:
       let us try a search shortcut through the hash
@@ -4799,7 +4795,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
   ut_ad(!trx_is_started(trx) || trx->state == TRX_STATE_ACTIVE);
 
   ut_ad(prebuilt->sql_stat_start || prebuilt->select_lock_type != LOCK_NONE ||
-        MVCC::is_view_active(trx->read_view) || srv_read_only_mode);
+        trx->read_view->is_open() || srv_read_only_mode);
 
   trx_start_if_not_started(trx, false);
 
@@ -4842,7 +4838,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
   if (!prebuilt->sql_stat_start) {
     /* No need to set an intention lock or assign a read view */
 
-    if (!MVCC::is_view_active(trx->read_view) && !srv_read_only_mode &&
+    if (!trx->read_view->is_open() && !srv_read_only_mode &&
         prebuilt->select_lock_type == LOCK_NONE) {
       ib::error(ER_IB_MSG_1031) << "MySQL is trying to perform a"
                                    " consistent read but the read view is not"
@@ -4855,9 +4851,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
     /* This is a consistent read */
     /* Assign a read view for the query */
 
-    if (!srv_read_only_mode) {
-      trx_assign_read_view(trx);
-    }
+    trx_assign_read_view(trx);
 
     prebuilt->sql_stat_start = FALSE;
   } else {
@@ -5355,7 +5349,8 @@ rec_loop:
     /* This is a non-locking consistent read: if necessary, fetch
     a previous version of the record */
 
-    if (trx->isolation_level == TRX_ISO_READ_UNCOMMITTED) {
+    if (trx->isolation_level == TRX_ISO_READ_UNCOMMITTED
+        || prebuilt->table->is_temporary()) {
       /* Do nothing: we let a non-locking SELECT read the
       latest version of the record */
 
@@ -5367,7 +5362,7 @@ rec_loop:
 
       if (srv_force_recovery < 5 &&
           !lock_clust_rec_cons_read_sees(rec, index, offsets,
-                                         trx_get_read_view(trx))) {
+                                         trx->read_view)) {
         rec_t *old_vers;
         /* The following call returns 'offsets' associated with 'old_vers' */
         err = row_sel_build_prev_vers_for_mysql(

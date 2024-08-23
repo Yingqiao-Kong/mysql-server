@@ -42,7 +42,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "lob0lob.h"
 #include "mach0data.h"
 #include "que0que.h"
-#include "read0read.h"
 #include "rem0cmp.h"
 #include "row0ext.h"
 #include "row0mysql.h"
@@ -375,7 +374,6 @@ static inline dtuple_t *row_build_low(ulint type, const dict_index_t *index,
   ut_ad(rec != nullptr);
   ut_ad(heap != nullptr);
   ut_ad(index->is_clustered());
-  ut_ad(!trx_sys_mutex_own());
   ut_ad(!col_map || col_table);
 
   if (!offsets) {
@@ -393,8 +391,8 @@ static inline dtuple_t *row_build_low(ulint type, const dict_index_t *index,
   times, and the cursor restore can happen multiple times for single
   insert or update statement.  */
   ut_a(!rec_offs_any_null_extern(rec, offsets) ||
-       trx_rw_is_active(row_get_rec_trx_id(rec, index, offsets), nullptr,
-                        false));
+       trx_sys->is_registered(current_trx(),
+                              row_get_rec_trx_id(rec, index, offsets)));
 #endif /* UNIV_DEBUG || UNIV_BLOB_LIGHT_DEBUG */
 
   if (type != ROW_COPY_POINTERS) {

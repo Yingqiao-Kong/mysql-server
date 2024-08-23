@@ -67,7 +67,7 @@ int lf_dynarray_iterate(LF_DYNARRAY *array, lf_dynarray_func func, void *arg);
 */
 
 #define LF_PINBOX_PINS 4
-#define LF_PURGATORY_SIZE 10
+#define LF_PURGATORY_SIZE 100
 
 typedef void lf_pinbox_free_func(void *, void *, void *);
 
@@ -109,14 +109,14 @@ static inline void lf_pin(LF_PINS *pins, int pin, void *addr) {
 #if defined(__GNUC__) && defined(MY_LF_EXTRA_DEBUG)
   assert(pin < LF_NUM_PINS_IN_THIS_FILE);
 #endif
-  pins->pin[pin].store(addr);
+  pins->pin[pin].store(addr, std::memory_order_release);
 }
 
 static inline void lf_unpin(LF_PINS *pins, int pin) {
 #if defined(__GNUC__) && defined(MY_LF_EXTRA_DEBUG)
   assert(pin < LF_NUM_PINS_IN_THIS_FILE);
 #endif
-  pins->pin[pin].store(nullptr);
+  pins->pin[pin].store(nullptr, std::memory_order_release);
 }
 
 void lf_pinbox_init(LF_PINBOX *pinbox, uint free_ptr_offset,
@@ -177,6 +177,7 @@ extern MYSQL_PLUGIN_IMPORT const int LF_HASH_OVERHEAD;
         in case someone keeps following that coding style.
  */
 typedef const uchar *(*hash_get_key_function)(const uchar *arg, size_t *length);
+typedef bool (*hash_walk_action)(void *t, void *);
 
 struct LF_HASH {
   LF_DYNARRAY array;             /* hash itself */
@@ -214,6 +215,7 @@ int lf_hash_insert(LF_HASH *hash, LF_PINS *pins, const void *data);
 void *lf_hash_search(LF_HASH *hash, LF_PINS *pins, const void *key,
                      uint keylen);
 int lf_hash_delete(LF_HASH *hash, LF_PINS *pins, const void *key, uint keylen);
+int lf_hash_iterate(LF_HASH *hash, LF_PINS *pins, hash_walk_action action, void *argument);
 
 static inline LF_PINS *lf_hash_get_pins(LF_HASH *hash) {
   return lf_pinbox_get_pins(&hash->alloc.pinbox);

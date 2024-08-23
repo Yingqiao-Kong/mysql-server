@@ -176,6 +176,8 @@ extern mysql_pfs_key_t clone_task_mutex_key;
 extern mysql_pfs_key_t clone_snapshot_mutex_key;
 extern mysql_pfs_key_t parallel_read_mutex_key;
 extern mysql_pfs_key_t dblwr_mutex_key;
+extern mysql_pfs_key_t rw_trx_hash_element_mutex_key;
+extern mysql_pfs_key_t read_view_mutex_key;
 #endif /* UNIV_PFS_MUTEX */
 
 #ifdef UNIV_PFS_RWLOCK
@@ -200,7 +202,6 @@ extern mysql_pfs_key_t trx_purge_latch_key;
 extern mysql_pfs_key_t index_tree_rw_lock_key;
 extern mysql_pfs_key_t index_online_log_key;
 extern mysql_pfs_key_t dict_table_stats_key;
-extern mysql_pfs_key_t trx_sys_rw_lock_key;
 extern mysql_pfs_key_t hash_table_locks_key;
 #endif /* UNIV_PFS_RWLOCK */
 
