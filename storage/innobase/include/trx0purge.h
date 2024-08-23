@@ -970,7 +970,7 @@ struct trx_purge_t {
   x-latch here for the instant at which it changes the purge view: an undo
   log operation can prevent this by obtaining an s-latch here. It also
   protects state and running */
-  rw_lock_t latch;
+  mutable rw_lock_t latch;
 #endif /* !UNIV_HOTBACKUP */
 
   /** State signal event */
@@ -990,10 +990,7 @@ struct trx_purge_t {
   que_t *query;
 
   /** The purge will not remove undo logs which are >= this view (purge view) */
-  ReadView view;
-
-  /** true if view is active */
-  bool view_active;
+  ReadViewBase view;
 
   /** Count of total tasks submitted to the task queue */
   volatile ulint n_submitted;
@@ -1056,6 +1053,27 @@ struct trx_purge_t {
 
   /** Set of all THDs allocated by the purge system. */
   ut::unordered_set<THD *> thds;
+
+  /** A wrapper around ReadViewBase::changes_visible(). */
+  bool changes_visible(trx_id_t id, const table_name_t &name) const {
+    ut_ad(rw_lock_own(&latch, RW_LOCK_S));
+    return view.changes_visible(id, name);
+  }
+
+  /** A wrapper around ReadViewBase::low_limit_no(). */
+  trx_id_t low_limit_no() const {
+#if 0 /* Unfortunately we don't hold this assertion, see MDEV-22718. */
+    ut_ad(rw_lock_own(&latch, RW_LOCK_S));
+#endif
+    return view.low_limit_no();
+  }
+
+  /** A wrapper around trx_sys_t::clone_oldest_view(). */
+  void clone_oldest_view() {
+    rw_lock_x_lock(&latch);
+    trx_sys->clone_oldest_view(&view);
+    rw_lock_x_unlock(&latch);
+  }
 };
 
 /** Choose the rollback segment with the smallest trx_no. */

@@ -1430,9 +1430,8 @@ bool srv_printf_innodb_monitor(FILE *file, bool nowait, ulint *trx_start_pos,
           "%" PRId32 " queries inside InnoDB, %" PRId32 " queries in queue\n",
           srv_conc_get_active_threads(), srv_conc_get_waiting_threads());
 
-  /* This is a dirty read, without holding trx_sys->mutex. */
   fprintf(file, ULINTPF " read views open inside InnoDB\n",
-          trx_sys->mvcc->size());
+          trx_sys->view_count());
 
   n_reserved = fil_space_get_n_reserved_extents(0);
   if (n_reserved > 0) {
@@ -1671,8 +1670,8 @@ void srv_export_innodb_status(void) {
   /* Purge always deals with transaction end points represented by
   transaction number. We are allowed to purge transactions with number
   below the low limit. */
-  ReadView oldest_view;
-  trx_sys->mvcc->clone_oldest_view(&oldest_view);
+  ReadViewBase oldest_view;
+  trx_sys->clone_oldest_view(&oldest_view);
   trx_id_t low_limit_no = oldest_view.view_low_limit_no();
 
   rw_lock_s_unlock(&purge_sys->latch);

@@ -229,7 +229,8 @@ void trx_undo_truncate_start(trx_rseg_t *rseg, page_no_t hdr_page_no,
  rollback segment created.
  @return the combined size of undo log segments in pages */
 ulint trx_undo_lists_init(
-    trx_rseg_t *rseg); /*!< in: rollback segment memory object */
+    trx_rseg_t *rseg,      /*!< in: rollback segment memory object */
+    trx_id_t &max_trx_id); /*!< in/out: maximum observed transaction ID */
 /** Assigns an undo log for a transaction. A new undo log is created or a cached
  undo log reused.
  @return DB_SUCCESS if undo log assign successful, possible error codes

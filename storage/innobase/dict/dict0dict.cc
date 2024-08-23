@@ -4050,7 +4050,7 @@ void dict_set_corrupted(dict_index_t *index) {
 
   index->type |= DICT_CORRUPT;
 
-  if (!srv_read_only_mode && !table->is_temporary()) {
+  if (!high_level_read_only && !table->is_temporary()) {
     PersistentTableMetadata metadata(table->id, table->version);
     metadata.add_corrupted_index(index_id_t(index->space, index->id));
 

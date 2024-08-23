@@ -46,7 +46,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "lob0inf.h"
 #include "lob0lob.h"
 #include "que0que.h"
-#include "read0read.h"
 #include "row0ext.h"
 #include "row0mysql.h"
 #include "row0row.h"
@@ -2436,7 +2435,7 @@ static MY_ATTRIBUTE((warn_unused_result)) bool trx_undo_get_undo_rec(
 
   rw_lock_s_lock(&purge_sys->latch);
 
-  missing_history = purge_sys->view.changes_visible(trx_id, name);
+  missing_history = purge_sys->changes_visible(trx_id, name);
   if (!missing_history) {
     *undo_rec = trx_undo_get_undo_rec_low(roll_ptr, heap, is_temp);
   }
@@ -2576,7 +2575,7 @@ bool trx_undo_prev_version_build(
       rw_lock_s_lock(&purge_sys->latch);
 
       missing_extern =
-          purge_sys->view.changes_visible(trx_id, index->table->name);
+          purge_sys->changes_visible(trx_id, index->table->name);
 
       rw_lock_s_unlock(&purge_sys->latch);
 

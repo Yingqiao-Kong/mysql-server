@@ -2175,15 +2175,13 @@ ibool page_validate(
   max_trx_id is ignored for temp tables because it not required
   for MVCC. */
 #ifndef UNIV_HOTBACKUP
-  if (dict_index_is_sec_or_ibuf(index) && !index->table->is_temporary() &&
-      page_is_leaf(page) && !page_is_empty(page)) {
+  if (!page_is_leaf(page) || page_is_empty(page) ||
+      !dict_index_is_sec_or_ibuf(index) ||
+      index->table->is_temporary()) {
+  } else if (trx_id_t sys_max_trx_id = trx_sys->get_max_trx_id()) {
     trx_id_t max_trx_id = page_get_max_trx_id(page);
-    /* This will be 0 during recv_apply_hashed_log_recs(TRUE),
-    because the transaction system has not been initialized yet */
-    trx_id_t sys_max_trx_id = trx_sys_get_max_trx_id();
 
-    if (max_trx_id == 0 ||
-        (sys_max_trx_id != 0 && max_trx_id > sys_max_trx_id)) {
+    if (max_trx_id == 0 || (max_trx_id > sys_max_trx_id)) {
       ib::error(ER_IB_MSG_898)
           << "PAGE_MAX_TRX_ID out of bounds: " << max_trx_id << ", "
           << sys_max_trx_id;

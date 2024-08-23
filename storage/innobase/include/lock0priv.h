@@ -1096,14 +1096,4 @@ struct Lock_iter {
   }
 };
 
-namespace locksys {
-class Unsafe_global_latch_manipulator {
- public:
-  static void exclusive_unlatch() { lock_sys->latches.global_latch.x_unlock(); }
-  static void exclusive_latch(ut::Location location) {
-    lock_sys->latches.global_latch.x_lock(location);
-  }
-};
-}  // namespace locksys
-
 #endif /* lock0priv_h */

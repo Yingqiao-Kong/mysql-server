@@ -887,16 +887,6 @@ int mtr_t::Logging::enable(THD *thd) {
     return err;
   }
 
-  /* 2. Wait for dirty pages to flush by forcing checkpoint at current LSN.
-  All no-logging page modification are done with the LSN when we stopped
-  redo logging. We need to have one write mini-transaction after enabling redo
-  to progress the system LSN and take a checkpoint. An easy way is to flush
-  the max transaction ID which is generally done at TRX_SYS_TRX_ID_WRITE_MARGIN
-  interval but safe to do any time. */
-  trx_sys_mutex_enter();
-  trx_sys_flush_max_trx_id();
-  trx_sys_mutex_exit();
-
   /* It would ensure that the modified page in previous mtr and all other
   pages modified before are flushed to disk. Since there could be large
   number of left over pages from LAD operation, we still don't enable
@@ -904,11 +894,11 @@ int mtr_t::Logging::enable(THD *thd) {
   log_make_latest_checkpoint(*log_sys);
   m_state.store(ENABLED_DBLWR);
 
-  /* 3. Take another checkpoint after enabling double write to ensure any page
+  /* 2. Take another checkpoint after enabling double write to ensure any page
   being written without double write are already synced to disk. */
   log_make_latest_checkpoint(*log_sys);
 
-  /* 4. Mark that it is safe to recover from crash. */
+  /* 3. Mark that it is safe to recover from crash. */
   log_persist_enable(*log_sys);
 
   ib::warn(ER_IB_WRN_REDO_ENABLED);

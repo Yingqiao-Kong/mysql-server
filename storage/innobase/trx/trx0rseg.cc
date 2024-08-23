@@ -49,14 +49,12 @@ This function is called only when a new rollback segment is created in
 the database.
 @param[in]	space_id	Space id
 @param[in]	page_size	Page size
-@param[in]	max_size	Max size in pages
 @param[in]	rseg_slot	Rseg id == slot number in RSEG_ARRAY
 @param[in,out]	mtr		Mini-transaction
 @return page number of the created segment, FIL_NULL if fail */
 page_no_t trx_rseg_header_create(space_id_t space_id,
                                  const page_size_t &page_size,
-                                 page_no_t max_size, ulint rseg_slot,
-                                 mtr_t *mtr) {
+                                 ulint rseg_slot, mtr_t *mtr) {
   page_no_t page_no;
   trx_rsegf_t *rsegf;
   trx_sysf_t *sys_header;
@@ -82,7 +80,7 @@ page_no_t trx_rseg_header_create(space_id_t space_id,
   rsegf = trx_rsegf_get_new(space_id, page_no, page_size, mtr);
 
   /* Initialize max size field */
-  mlog_write_ulint(rsegf + TRX_RSEG_MAX_SIZE, max_size, MLOG_4BYTES, mtr);
+  mlog_write_ulint(rsegf + TRX_RSEG_FORMAT, 0, MLOG_4BYTES, mtr);
 
   /* Initialize the history list */
   mlog_write_ulint(rsegf + TRX_RSEG_HISTORY_SIZE, 0, MLOG_4BYTES, mtr);
@@ -220,7 +218,7 @@ static void trx_rseg_persist_gtid(trx_rseg_t *rseg, trx_id_t gtid_trx_no) {
 trx_rseg_t *trx_rseg_mem_create(ulint id, space_id_t space_id,
                                 page_no_t page_no, const page_size_t &page_size,
                                 trx_id_t gtid_trx_no, purge_pq_t *purge_queue,
-                                mtr_t *mtr) {
+                                trx_id_t &max_trx_id, mtr_t *mtr) {
   auto rseg = static_cast<trx_rseg_t *>(ut_zalloc_nokey(sizeof(trx_rseg_t)));
 
   rseg->id = id;
@@ -244,15 +242,19 @@ trx_rseg_t *trx_rseg_mem_create(ulint id, space_id_t space_id,
 
   auto rseg_header = trx_rsegf_get_new(space_id, page_no, page_size, mtr);
 
-  rseg->max_size =
-      mtr_read_ulint(rseg_header + TRX_RSEG_MAX_SIZE, MLOG_4BYTES, mtr);
+  if (mach_read_from_4(rseg_header + TRX_RSEG_FORMAT) == 0) {
+    trx_id_t id = mach_read_from_8(rseg_header + TRX_RSEG_MAX_TRX_ID);
+    if (id > max_trx_id) {
+      max_trx_id = id;
+    }
+  }
 
   /* Initialize the undo log lists according to the rseg header */
 
-  auto sum_of_undo_sizes = trx_undo_lists_init(rseg);
+  auto sum_of_undo_sizes = trx_undo_lists_init(rseg, max_trx_id);
 
   rseg->set_curr_size(
-      mtr_read_ulint(rseg_header + TRX_RSEG_HISTORY_SIZE, MLOG_4BYTES, mtr) +
+      mach_read_from_4(rseg_header + TRX_RSEG_HISTORY_SIZE) +
       1 + sum_of_undo_sizes);
 
   auto len = flst_get_len(rseg_header + TRX_RSEG_HISTORY);
@@ -274,7 +276,15 @@ trx_rseg_t *trx_rseg_mem_create(ulint id, space_id_t space_id,
                           rseg->page_size, mtr) +
         node_addr.boffset;
 
+    trx_id_t id = mach_read_from_8(undo_log_hdr + TRX_UNDO_TRX_ID);
+    if (id > max_trx_id) {
+      max_trx_id = id;
+    }
+
     rseg->last_trx_no = mach_read_from_8(undo_log_hdr + TRX_UNDO_TRX_NO);
+    if (rseg->last_trx_no > max_trx_id) {
+      max_trx_id = rseg->last_trx_no;
+    }
 
 #ifdef UNIV_DEBUG
     /* Update last transaction number during recovery. */
@@ -344,12 +354,16 @@ void trx_rsegs_init(purge_pq_t *purge_queue) {
   space_id_t space_id;
   page_no_t page_no;
   trx_rseg_t *rseg = nullptr;
+  trx_id_t max_trx_id = 0;
 
   /* Get GTID transaction number from SYS */
   mtr.start();
   trx_sysf_t *sys_header = trx_sysf_get(&mtr);
   auto page = sys_header - TRX_SYS;
   auto gtid_trx_no = mach_read_from_8(page + TRX_SYS_TRX_NUM_GTID);
+  if (gtid_trx_no > max_trx_id) {
+    max_trx_id = gtid_trx_no;
+  }
 
   mtr.commit();
 
@@ -359,6 +373,13 @@ void trx_rsegs_init(purge_pq_t *purge_queue) {
   for (slot = 0; slot < TRX_SYS_N_RSEGS; slot++) {
     mtr.start();
     trx_sysf_t *sys_header = trx_sysf_get(&mtr);
+
+    if (slot == 0) {
+      trx_id_t trx_id = mach_read_from_8(sys_header + TRX_SYS_TRX_ID_STORE);
+      if (trx_id > max_trx_id) {
+        max_trx_id = trx_id;
+      }
+    }
 
     page_no = trx_sysf_rseg_get_page_no(sys_header, slot, &mtr);
 
@@ -370,7 +391,7 @@ void trx_rsegs_init(purge_pq_t *purge_queue) {
         Note that all tablespaces with rollback segments
         use univ_page_size. (system, temp & undo) */
         rseg = trx_rseg_mem_create(slot, space_id, page_no, univ_page_size,
-                                   gtid_trx_no, purge_queue, &mtr);
+                                   gtid_trx_no, purge_queue, max_trx_id, &mtr);
 
         ut_a(rseg->id == slot);
 
@@ -405,7 +426,7 @@ void trx_rsegs_init(purge_pq_t *purge_queue) {
       use univ_page_size. */
       rseg =
           trx_rseg_mem_create(slot, undo_space->id(), page_no, univ_page_size,
-                              gtid_trx_no, purge_queue, &mtr);
+                              gtid_trx_no, purge_queue, max_trx_id, &mtr);
 
       ut_a(rseg->id == slot);
 
@@ -425,6 +446,8 @@ void trx_rsegs_init(purge_pq_t *purge_queue) {
       }
     }
   }
+
+  trx_sys->init_max_trx_id(max_trx_id + 1);
   undo::spaces->s_unlock();
 }
 
@@ -457,7 +480,7 @@ page_no_t trx_rseg_create(space_id_t space_id, ulint rseg_id) {
   }
 
   page_no_t page_no = trx_rseg_header_create(space_id, univ_page_size,
-                                             PAGE_NO_MAX, rseg_id, &mtr);
+                                             rseg_id, &mtr);
 
   mtr_commit(&mtr);
 
@@ -540,6 +563,7 @@ bool trx_rseg_add_rollback_segments(space_id_t space_id, ulong target_rsegs,
   ulint n_existing = 0;
   ulint n_created = 0;
   ulint n_tracked = 0;
+  trx_id_t max_trx_id = trx_sys->get_max_trx_id();
 
   enum space_type_t { TEMP, UNDO } type;
 
@@ -614,7 +638,7 @@ bool trx_rseg_add_rollback_segments(space_id_t space_id, ulong target_rsegs,
     }
 
     rseg = trx_rseg_mem_create(rseg_id, space_id, page_no, univ_page_size, 0,
-                               purge_sys->purge_queue, &mtr);
+                               purge_sys->purge_queue, max_trx_id, &mtr);
 
     mtr.commit();
 

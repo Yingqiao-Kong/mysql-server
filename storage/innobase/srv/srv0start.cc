@@ -1334,7 +1334,7 @@ dberr_t srv_undo_tablespaces_upgrade() {
   rsegs and undo tablespaces they are in from being deleted.
   These transactions must be either committed or rolled back by
   the mysql server.*/
-  if (trx_sys->n_prepared_trx > 0) {
+  if (trx_sys->n_prepared_trx.load(std::memory_order_relaxed) > 0) {
     ib::warn(ER_IB_MSG_1094);
     return (DB_SUCCESS);
   }
@@ -2904,7 +2904,7 @@ void srv_dict_recover_on_restart() {
   The data dictionary latch should guarantee that there is at
   most one data dictionary transaction active at a time. */
   if (srv_force_recovery < SRV_FORCE_NO_TRX_UNDO && trx_sys_need_rollback()) {
-    trx_rollback_or_clean_recovered(FALSE);
+    trx_rollback_recovered(FALSE);
   }
 
   /* Do after all DD transactions recovery, to get consistent metadata */

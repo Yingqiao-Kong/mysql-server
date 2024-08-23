@@ -88,14 +88,12 @@ This function is called only when a new rollback segment is created in
 the database.
 @param[in]	space_id	Space id
 @param[in]	page_size	Page size
-@param[in]	max_size	Max size in pages
 @param[in]	rseg_slot	Rseg id == slot number in RSEG_ARRAY
 @param[in,out]	mtr		Mini-transaction
 @return page number of the created segment, FIL_NULL if fail */
 page_no_t trx_rseg_header_create(space_id_t space_id,
                                  const page_size_t &page_size,
-                                 page_no_t max_size, ulint rseg_slot,
-                                 mtr_t *mtr);
+                                 ulint rseg_slot, mtr_t *mtr);
 
 /** Add more rsegs to the rseg list in each tablespace until there are
 srv_rollback_segments of them.  Use any rollback segment that already
@@ -140,12 +138,13 @@ The caller must insert it into the correct list.
 @param[in]	page_size	Page size
 @param[in]      gtid_trx_no     Trx number up to which GTID is persisted
 @param[in,out]	purge_queue	Rseg queue
+@param[in,out]	max_trx_id	Maximum observed transaction id
 @param[in,out]	mtr		Mini-transaction
 @return own: rollback segment object */
 trx_rseg_t *trx_rseg_mem_create(ulint id, space_id_t space_id,
                                 page_no_t page_no, const page_size_t &page_size,
                                 trx_id_t gtid_trx_no, purge_pq_t *purge_queue,
-                                mtr_t *mtr);
+                                trx_id_t &max_trx_id, mtr_t *mtr);
 
 /** Create a rollback segment in the given tablespace. This could be either
 the system tablespace, the temporary tablespace, or an undo tablespace.
@@ -201,9 +200,9 @@ void trx_rsegsf_set_page_no(trx_rsegsf_t *rsegs_header, ulint slot,
 
 /* Transaction rollback segment header */
 /*-------------------------------------------------------------*/
-#define TRX_RSEG_MAX_SIZE                \
-  0 /* Maximum allowed size for rollback \
-    segment in pages */
+#define TRX_RSEG_FORMAT                     \
+  0 /* -2 = pre - get max_trx_id by TRX_SYS_PAGE; \
+    0 = later - get max_trx_id by rseg */
 #define TRX_RSEG_HISTORY_SIZE        \
   4 /* Number of file pages occupied \
     by the logs in the history list */
@@ -215,6 +214,9 @@ this page is placed */
 #define TRX_RSEG_FSEG_HEADER (8 + FLST_BASE_NODE_SIZE)
 /* Undo log segment slots */
 #define TRX_RSEG_UNDO_SLOTS (8 + FLST_BASE_NODE_SIZE + FSEG_HEADER_SIZE)
+/* Maximum transaction ID (valid only if TRX_RSEG_FORMAT is 0) */
+#define TRX_RSEG_MAX_TRX_ID (TRX_RSEG_UNDO_SLOTS + TRX_RSEG_N_SLOTS \
+  * TRX_RSEG_SLOT_SIZE)
 
 /* End of undo slots in rollback segment page. */
 #define TRX_RSEG_SLOT_END \

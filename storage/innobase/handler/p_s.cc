@@ -143,21 +143,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 static const char *g_engine = "INNODB";
 static const size_t g_engine_length = 6;
 
-inline trx_t *get_next_trx(const trx_t *trx, bool read_write) {
-  if (read_write) {
-    return (UT_LIST_GET_NEXT(trx_list, trx));
-  } else {
-    return (UT_LIST_GET_NEXT(mysql_trx_list, trx));
-  }
-}
-
 /** Pass of a given scan. */
 enum scan_pass {
   INIT_SCANNING,
-  /** Scan the RW trx list.
-  @sa trx_sys_t::rw_trx_list
-  */
-  SCANNING_RW_TRX_LIST,
   /** Scan the MySQL trx list.
   @sa trx_t::mysql_trx_list
   */
@@ -203,12 +191,6 @@ class Innodb_trx_scan_state {
     } else {
       switch (m_scan_pass) {
         case INIT_SCANNING:
-          m_scan_pass = SCANNING_RW_TRX_LIST;
-          m_start_trx_id_range = 0;
-          m_end_trx_id_range = SCAN_RANGE;
-          m_next_trx_id_range = TRX_ID_MAX;
-          break;
-        case SCANNING_RW_TRX_LIST:
           m_scan_pass = SCANNING_MYSQL_TRX_LIST;
           m_start_trx_id_range = 0;
           m_end_trx_id_range = SCAN_RANGE;
@@ -274,12 +256,10 @@ class Innodb_data_lock_iterator : public PSI_engine_data_lock_iterator {
   @param[in] with_lock_data	True if column LOCK_DATA
   needs to be populated.
   @param[in] read_write		True if the trx list is the RW list
-  @param[in] trx_list		The trx list to scan
   @returns The number of records found
   */
   size_t scan_trx_list(PSI_server_data_lock_container *container,
-                       bool with_lock_data, bool read_write,
-                       trx_ut_list_t *trx_list);
+                       bool with_lock_data, bool read_write);
 
   /** Scan a given trx.
   Either scan all the locks for a transaction,
@@ -322,12 +302,11 @@ class Innodb_data_lock_wait_iterator
  private:
   /** Scan a given transaction list.
   @param[in] container		The container to fill
-  @param[in] read_write		True if the transaction list is the RW list.
-  @param[in] trx_list		The trx list to scan
+  @param[in] read_write		True if the transaction list is RW.
   @returns the number of records found.
   */
   size_t scan_trx_list(PSI_server_data_lock_wait_container *container,
-                       bool read_write, trx_ut_list_t *trx_list);
+                       bool read_write);
 
   /** Scan a given transaction.
   Either scan all the waits for a transaction,
@@ -354,9 +333,9 @@ class Innodb_data_lock_wait_iterator
 Transactions present in any TRX LIST that have not started yet
 are discarded, when inspecting data locks.
 Transactions present in the MySQL TRX LIST,
-that are writing data and have an id, are also discarded.
+that are not read_write data, are also discarded.
 @param[in] trx Transaction to evaluate
-@param[in] read_write True if trx is in the RW TRX list
+@param[in] read_write True if trx is RW
 @returns True if the trx should be discarded
 */
 bool discard_trx(const trx_t *trx, bool read_write) {
@@ -373,13 +352,11 @@ bool discard_trx(const trx_t *trx, bool read_write) {
 
 /** Find a transaction in a TRX LIST.
 @param[in] filter_trx_immutable_id  The transaction immutable id
-@param[in] read_write	            True for the RW TRX LIST
-@param[in] trx_list	            The transaction list
+@param[in] read_write	            True for the RW TRX
 @returns The transaction when found, or NULL
 */
 static const trx_t *fetch_trx_in_trx_list(uint64_t filter_trx_immutable_id,
-                                          bool read_write,
-                                          trx_ut_list_t *trx_list) {
+                                          bool read_write) {
   const trx_t *trx;
 
   /* It is not obvious if and why we need lock_sys exclusive access, but we do
@@ -387,8 +364,8 @@ static const trx_t *fetch_trx_in_trx_list(uint64_t filter_trx_immutable_id,
   ut_ad(locksys::owns_exclusive_global_latch());
   ut_ad(trx_sys_mutex_own());
 
-  for (trx = UT_LIST_GET_FIRST(*trx_list); trx != nullptr;
-       trx = get_next_trx(trx, read_write)) {
+  for (trx = UT_LIST_GET_FIRST(trx_sys->mysql_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(mysql_trx_list, trx)) {
     if (discard_trx(trx, read_write)) {
       continue;
     }
@@ -592,15 +569,8 @@ bool Innodb_data_lock_iterator::scan(PSI_server_data_lock_container *container,
 
   size_t found = 0;
 
-  while ((m_scan_state.get_pass() == SCANNING_RW_TRX_LIST) && (found == 0)) {
-    found =
-        scan_trx_list(container, with_lock_data, true, &trx_sys->rw_trx_list);
-    m_scan_state.prepare_next_scan();
-  }
-
   while ((m_scan_state.get_pass() == SCANNING_MYSQL_TRX_LIST) && (found == 0)) {
-    found = scan_trx_list(container, with_lock_data, false,
-                          &trx_sys->mysql_trx_list);
+    found = scan_trx_list(container, with_lock_data, true);
     m_scan_state.prepare_next_scan();
   }
 
@@ -635,12 +605,7 @@ bool Innodb_data_lock_iterator::fetch(PSI_server_data_lock_container *container,
 
   trx_sys_mutex_enter();
 
-  trx = fetch_trx_in_trx_list(trx_immutable_id, true, &trx_sys->rw_trx_list);
-
-  if (trx == nullptr) {
-    trx = fetch_trx_in_trx_list(trx_immutable_id, false,
-                                &trx_sys->mysql_trx_list);
-  }
+  trx = fetch_trx_in_trx_list(trx_immutable_id, true);
 
   if (trx != nullptr) {
     scan_trx(container, with_lock_data, trx, true, lock_immutable_id, heap_id);
@@ -655,13 +620,12 @@ bool Innodb_data_lock_iterator::fetch(PSI_server_data_lock_container *container,
 @param[in] container		The container to fill
 @param[in] with_lock_data	True if column LOCK_DATA
 needs to be populated.
-@param[in] read_write		True if the trx list is the RW list
-@param[in] trx_list		The trx list to scan
+@param[in] read_write		True if the trx is RW
 @returns The number of records found
 */
 size_t Innodb_data_lock_iterator::scan_trx_list(
     PSI_server_data_lock_container *container, bool with_lock_data,
-    bool read_write, trx_ut_list_t *trx_list) {
+    bool read_write) {
   const trx_t *trx;
   trx_id_t trx_id;
   size_t found = 0;
@@ -671,8 +635,8 @@ size_t Innodb_data_lock_iterator::scan_trx_list(
   ut_ad(locksys::owns_exclusive_global_latch());
   ut_ad(trx_sys_mutex_own());
 
-  for (trx = UT_LIST_GET_FIRST(*trx_list); trx != nullptr;
-       trx = get_next_trx(trx, read_write)) {
+  for (trx = UT_LIST_GET_FIRST(trx_sys->mysql_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(mysql_trx_list, trx)) {
     if (discard_trx(trx, read_write)) {
       continue;
     }
@@ -865,13 +829,8 @@ bool Innodb_data_lock_wait_iterator::scan(
 
   size_t found = 0;
 
-  while ((m_scan_state.get_pass() == SCANNING_RW_TRX_LIST) && (found == 0)) {
-    found = scan_trx_list(container, true, &trx_sys->rw_trx_list);
-    m_scan_state.prepare_next_scan();
-  }
-
   while ((m_scan_state.get_pass() == SCANNING_MYSQL_TRX_LIST) && (found == 0)) {
-    found = scan_trx_list(container, false, &trx_sys->mysql_trx_list);
+    found = scan_trx_list(container, true);
     m_scan_state.prepare_next_scan();
   }
 
@@ -921,13 +880,7 @@ bool Innodb_data_lock_wait_iterator::fetch(
 
   trx_sys_mutex_enter();
 
-  trx = fetch_trx_in_trx_list(requesting_trx_immutable_id, true,
-                              &trx_sys->rw_trx_list);
-
-  if (trx == nullptr) {
-    trx = fetch_trx_in_trx_list(requesting_trx_immutable_id, false,
-                                &trx_sys->mysql_trx_list);
-  }
+  trx = fetch_trx_in_trx_list(requesting_trx_immutable_id, true);
 
   if (trx != nullptr) {
     scan_trx(container, trx, true, requesting_lock_immutable_id,
@@ -941,13 +894,11 @@ bool Innodb_data_lock_wait_iterator::fetch(
 
 /** Scan a given transaction list.
 @param[in] container		The container to fill
-@param[in] read_write		True if the transaction list is the RW list.
-@param[in] trx_list		The trx list to scan
+@param[in] read_write		True if the transaction list is RW.
 @returns the number of records found.
 */
 size_t Innodb_data_lock_wait_iterator::scan_trx_list(
-    PSI_server_data_lock_wait_container *container, bool read_write,
-    trx_ut_list_t *trx_list) {
+    PSI_server_data_lock_wait_container *container, bool read_write) {
   const trx_t *trx;
   trx_id_t trx_id;
   size_t found = 0;
@@ -957,8 +908,8 @@ size_t Innodb_data_lock_wait_iterator::scan_trx_list(
   ut_ad(locksys::owns_exclusive_global_latch());
   ut_ad(trx_sys_mutex_own());
 
-  for (trx = UT_LIST_GET_FIRST(*trx_list); trx != nullptr;
-       trx = get_next_trx(trx, read_write)) {
+  for (trx = UT_LIST_GET_FIRST(trx_sys->mysql_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(mysql_trx_list, trx)) {
     if (discard_trx(trx, read_write)) {
       continue;
     }

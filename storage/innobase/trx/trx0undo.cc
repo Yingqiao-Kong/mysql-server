@@ -936,10 +936,6 @@ buf_block_t *trx_undo_add_page(
 
   rseg = undo_ptr->rseg;
 
-  if (rseg->get_curr_size() == rseg->max_size) {
-    return (nullptr);
-  }
-
   header_page = trx_undo_page_get(page_id_t(undo->space, undo->hdr_page_no),
                                   undo->page_size, mtr);
 
@@ -1048,32 +1044,6 @@ void trx_undo_free_last_page_func(
                          undo->last_page_no, mtr);
 
   undo->size--;
-}
-
-/** Empties an undo log header page of undo records for that undo log.
-Other undo logs may still have records on that page, if it is an update
-undo log.
-@param[in]      space_id     Tablespace ID
-@param[in]      page_size    Page size
-@param[in]      hdr_page_no  Header page number
-@param[in]      hdr_offset   Header offset
-@param[in,out]  mtr          Mini-transaction */
-static void trx_undo_empty_header_page(space_id_t space_id,
-                                       const page_size_t &page_size,
-                                       page_no_t hdr_page_no, ulint hdr_offset,
-                                       mtr_t *mtr) {
-  page_t *header_page;
-  trx_ulogf_t *log_hdr;
-  ulint end;
-
-  header_page =
-      trx_undo_page_get(page_id_t(space_id, hdr_page_no), page_size, mtr);
-
-  log_hdr = header_page + hdr_offset;
-
-  end = trx_undo_page_get_end(header_page, hdr_page_no, hdr_offset);
-
-  mlog_write_ulint(log_hdr + TRX_UNDO_LOG_START, end, MLOG_2BYTES, mtr);
 }
 
 /** Get page offset up to which undo logs can be truncated.
@@ -1233,8 +1203,15 @@ loop:
   page_no = page_get_page_no(undo_page);
 
   if (page_no == hdr_page_no) {
-    trx_undo_empty_header_page(rseg->space_id, rseg->page_size, hdr_page_no,
-                               hdr_offset, &mtr);
+    uint16_t end = mach_read_from_2(hdr_offset + TRX_UNDO_NEXT_LOG
+                                    + undo_page);
+    if (end == 0) {
+      end = mach_read_from_2(TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_FREE
+                             + undo_page);
+    }
+
+    mlog_write_ulint(undo_page + hdr_offset + TRX_UNDO_LOG_START,
+                     end, MLOG_2BYTES, &mtr);
   } else {
     trx_undo_free_page(rseg, TRUE, rseg->space_id, hdr_page_no, page_no, &mtr);
   }
@@ -1298,7 +1275,8 @@ static trx_undo_t *trx_undo_mem_init(
     trx_rseg_t *rseg,  /*!< in: rollback segment memory object */
     ulint id,          /*!< in: slot index within rseg */
     page_no_t page_no, /*!< in: undo log segment page number */
-    mtr_t *mtr)        /*!< in: mtr */
+    mtr_t *mtr,        /*!< in: mtr */
+    trx_id_t &max_trx_id) /**!< in/out: maximum observed transaction ID  */
 {
   page_t *undo_page;
   trx_upagef_t *page_header;
@@ -1330,8 +1308,6 @@ static trx_undo_t *trx_undo_mem_init(
 
   undo_header = undo_page + offset;
 
-  trx_id = mach_read_from_8(undo_header + TRX_UNDO_TRX_ID);
-
   auto flag = mtr_read_ulint(undo_header + TRX_UNDO_FLAGS, MLOG_1BYTE, mtr);
 
   bool xid_exists = ((flag & TRX_UNDO_FLAG_XID) != 0);
@@ -1342,6 +1318,11 @@ static trx_undo_t *trx_undo_mem_init(
 
   if (xid_exists) {
     trx_undo_read_xid(undo_header, &xid);
+  }
+
+  trx_id = mach_read_from_8(undo_header + TRX_UNDO_TRX_ID);
+  if (trx_id > max_trx_id) {
+    max_trx_id = trx_id;
   }
 
   undo = trx_undo_mem_create(rseg, id, type, trx_id, &xid, page_no, offset);
@@ -1368,6 +1349,13 @@ static trx_undo_t *trx_undo_mem_init(
   /* If the log segment is being freed, the page list is inconsistent! */
   if (state == TRX_UNDO_TO_FREE) {
     goto add_to_list;
+  }
+
+  if (state == TRX_UNDO_TO_PURGE || state == TRX_UNDO_CACHED) {
+    trx_id = mach_read_from_8(undo_header + TRX_UNDO_TRX_NO);
+    if (trx_id > max_trx_id) {
+      max_trx_id = trx_id;
+    }
   }
 
   last_addr = flst_get_last(seg_header + TRX_UNDO_PAGE_LIST, mtr);
@@ -1420,7 +1408,8 @@ add_to_list:
  segment is created.
  @return the combined size of undo log segments in pages */
 ulint trx_undo_lists_init(
-    trx_rseg_t *rseg) /*!< in: rollback segment memory object */
+    trx_rseg_t *rseg,     /*!< in: rollback segment memory object */
+    trx_id_t &max_trx_id) /*!< in/out: maximum observed transaction ID */
 {
   ulint size = 0;
   trx_rsegf_t *rseg_header;
@@ -1446,7 +1435,7 @@ ulint trx_undo_lists_init(
         srv_force_recovery < SRV_FORCE_NO_UNDO_LOG_SCAN) {
       trx_undo_t *undo;
 
-      undo = trx_undo_mem_init(rseg, i, page_no, &mtr);
+      undo = trx_undo_mem_init(rseg, i, page_no, &mtr, max_trx_id);
 
       size += undo->size;
 
@@ -1573,10 +1562,6 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   page_t *undo_page;
 
   ut_ad(mutex_own(&(rseg->mutex)));
-
-  if (rseg->get_curr_size() == rseg->max_size) {
-    return DB_OUT_OF_FILE_SPACE;
-  }
 
   rseg->incr_curr_size();
 
@@ -2130,7 +2115,7 @@ bool trx_undo_truncate_tablespace(undo::Tablespace *marked_space) {
     rseg->space_id = new_space_id;
 
     rseg->page_no = trx_rseg_header_create(new_space_id, univ_page_size,
-                                           PAGE_NO_MAX, rseg->id, &mtr);
+                                           rseg->id, &mtr);
 
     ut_a(rseg->page_no != FIL_NULL);
 
@@ -2164,9 +2149,6 @@ bool trx_undo_truncate_tablespace(undo::Tablespace *marked_space) {
     UT_LIST_INIT(rseg->update_undo_cached, &trx_undo_t::undo_list);
     UT_LIST_INIT(rseg->insert_undo_list, &trx_undo_t::undo_list);
     UT_LIST_INIT(rseg->insert_undo_cached, &trx_undo_t::undo_list);
-
-    rseg->max_size =
-        mtr_read_ulint(rseg_header + TRX_RSEG_MAX_SIZE, MLOG_4BYTES, &mtr);
 
     /* Initialize the undo log lists according to the rseg header */
     rseg->set_curr_size(

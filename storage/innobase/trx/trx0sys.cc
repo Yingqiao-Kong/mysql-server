@@ -46,7 +46,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "log0recv.h"
 #include "mtr0log.h"
 #include "os0file.h"
-#include "read0read.h"
 #include "srv0srv.h"
 #include "srv0start.h"
 #include "trx0purge.h"
@@ -60,7 +59,7 @@ trx_sys_t *trx_sys = nullptr;
 /** Check whether transaction id is valid.
 @param[in]	id	transaction id to check
 @param[in]	name	table name */
-void ReadView::check_trx_id_sanity(trx_id_t id, const table_name_t &name) {
+void ReadViewBase::check_trx_id_sanity(trx_id_t id, const table_name_t &name) {
   if (&name == &dict_sys->dynamic_metadata->name) {
     /* The table mysql.innodb_dynamic_metadata uses a
     constant DB_TRX_ID=~0. */
@@ -68,7 +67,7 @@ void ReadView::check_trx_id_sanity(trx_id_t id, const table_name_t &name) {
     return;
   }
 
-  if (id >= trx_sys->max_trx_id) {
+  if (id >= trx_sys->get_max_trx_id()) {
     ib::warn(ER_IB_MSG_1196)
         << "A transaction id"
         << " in a record of table " << name << " is newer than the"
@@ -95,25 +94,6 @@ void ReadView::check_trx_id_sanity(trx_id_t id, const table_name_t &name) {
 uint trx_rseg_n_slots_debug = 0;
 #endif /* UNIV_DEBUG */
 
-/** Writes the value of max_trx_id to the file based trx system header. */
-void trx_sys_flush_max_trx_id(void) {
-  mtr_t mtr;
-  trx_sysf_t *sys_header;
-
-  ut_ad(trx_sys_mutex_own());
-
-  if (!srv_read_only_mode) {
-    mtr_start(&mtr);
-
-    sys_header = trx_sysf_get(&mtr);
-
-    mlog_write_ull(sys_header + TRX_SYS_TRX_ID_STORE, trx_sys->max_trx_id,
-                   &mtr);
-
-    mtr_commit(&mtr);
-  }
-}
-
 void trx_sys_persist_gtid_num(trx_id_t gtid_trx_no) {
   mtr_t mtr;
   mtr.start();
@@ -126,31 +106,31 @@ void trx_sys_persist_gtid_num(trx_id_t gtid_trx_no) {
 }
 
 trx_id_t trx_sys_oldest_trx_no() {
-  ut_ad(trx_sys_mutex_own());
-  /* Get the oldest transaction from serialisation list. */
-  if (UT_LIST_GET_LEN(trx_sys->serialisation_list) > 0) {
-    auto trx = UT_LIST_GET_FIRST(trx_sys->serialisation_list);
-    return (trx->no);
+  return trx_sys->get_min_trx_no();
+}
+
+static bool trx_sys_get_binlog_prepared_callback(
+    rw_trx_hash_element_t *element, std::vector<trx_id_t> *trx_ids) {
+  mutex_enter(&element->mutex);
+
+  if (trx_t *trx = element->trx) {
+    if (trx_state_eq(trx, TRX_STATE_PREPARED) && trx_is_mysql_xa(trx)) {
+      trx_ids->push_back(trx->id);
+    }
   }
-  return (trx_sys->max_trx_id);
+
+  mutex_exit(&element->mutex);
+  return false;
 }
 
 void trx_sys_get_binlog_prepared(std::vector<trx_id_t> &trx_ids) {
-  trx_sys_mutex_enter();
   /* Exit fast if no prepared transaction. */
-  if (trx_sys->n_prepared_trx == 0) {
-    trx_sys_mutex_exit();
+  if (trx_sys->n_prepared_trx.load() == 0) {
     return;
   }
-  /* Check and find binary log prepared transaction. */
-  for (auto trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
-       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
-    assert_trx_in_rw_list(trx);
-    if (trx_state_eq(trx, TRX_STATE_PREPARED) && trx_is_mysql_xa(trx)) {
-      trx_ids.push_back(trx->id);
-    }
-  }
-  trx_sys_mutex_exit();
+
+  trx_sys->rw_trx_hash.iterate_no_dups(
+      trx_sys_get_binlog_prepared_callback, &trx_ids);
 }
 
 /** Read binary log positions from buffer passed.
@@ -380,9 +360,6 @@ static void trx_sysf_create(mtr_t *mtr) /*!< in: mtr */
 
   sys_header = trx_sysf_get(mtr);
 
-  /* Start counting transaction ids from number 1 up */
-  mach_write_to_8(sys_header + TRX_SYS_TRX_ID_STORE, 1);
-
   /* Reset the rollback segment slots.  Old versions of InnoDB
   define TRX_SYS_N_RSEGS as 256 (TRX_SYS_OLD_N_RSEGS) and expect
   that the whole array is initialized. */
@@ -400,11 +377,31 @@ static void trx_sysf_create(mtr_t *mtr) /*!< in: mtr */
 
   /* Create the first rollback segment in the SYSTEM tablespace */
   slot_no = trx_sysf_rseg_find_free(mtr);
-  page_no = trx_rseg_header_create(TRX_SYS_SPACE, univ_page_size, PAGE_NO_MAX,
+  page_no = trx_rseg_header_create(TRX_SYS_SPACE, univ_page_size,
                                    slot_no, mtr);
 
   ut_a(slot_no == TRX_SYS_SYSTEM_RSEG_ID);
   ut_a(page_no == FSP_FIRST_RSEG_PAGE_NO);
+}
+
+struct trx_undo_count_callback_arg {
+  ib_uint64_t rows_to_undo;
+};
+
+static bool trx_undo_count_callback(rw_trx_hash_element_t *element,
+                                    trx_undo_count_callback_arg *arg) {
+  mutex_enter(&element->mutex);
+
+  if (trx_t *trx= element->trx) {
+    ut_ad(trx->is_recovered);
+
+    if (trx_state_eq(trx, TRX_STATE_ACTIVE)) {
+      arg->rows_to_undo += trx->undo_no;
+    }
+  }
+
+  mutex_exit(&element->mutex);
+  return false;
 }
 
 /** Creates and initializes the central memory structures for the transaction
@@ -412,7 +409,6 @@ static void trx_sysf_create(mtr_t *mtr) /*!< in: mtr */
  @return min binary heap of rsegs to purge */
 purge_pq_t *trx_sys_init_at_db_start(void) {
   purge_pq_t *purge_queue;
-  trx_sysf_t *sys_header;
   ib_uint64_t rows_to_undo = 0;
   const char *unit = "";
 
@@ -429,30 +425,11 @@ purge_pq_t *trx_sys_init_at_db_start(void) {
     trx_rsegs_init(purge_queue);
   }
 
-  /* VERY important: after the database is started, max_trx_id value is
-  divisible by TRX_SYS_TRX_ID_WRITE_MARGIN, and the 'if' in
-  trx_sys_get_new_trx_id will evaluate to TRUE when the function
-  is first time called, and the value for trx id will be written
-  to the disk-based header! Thus trx id values will not overlap when
-  the database is repeatedly started! */
-
-  mtr_t mtr;
-  mtr.start();
-
-  sys_header = trx_sysf_get(&mtr);
-
-  trx_sys->max_trx_id =
-      2 * TRX_SYS_TRX_ID_WRITE_MARGIN +
-      ut_uint64_align_up(mach_read_from_8(sys_header + TRX_SYS_TRX_ID_STORE),
-                         TRX_SYS_TRX_ID_WRITE_MARGIN);
-
-  mtr.commit();
-
 #ifdef UNIV_DEBUG
   /* max_trx_id is the next transaction ID to assign. Initialize maximum
   transaction number to one less if all transactions are already purged. */
   if (trx_sys->rw_max_trx_no == 0) {
-    trx_sys->rw_max_trx_no = trx_sys->max_trx_id - 1;
+    trx_sys->rw_max_trx_no = trx_sys->get_max_trx_id() - 1;
   }
 #endif /* UNIV_DEBUG */
 
@@ -464,38 +441,28 @@ purge_pq_t *trx_sys_init_at_db_start(void) {
   the debug code (assertions). We are still running in single threaded
   bootstrap mode. */
 
-  trx_sys_mutex_enter();
+  if (trx_sys->rw_trx_hash.size() > 0) {
+    trx_undo_count_callback_arg arg{ 0 };
 
-  if (UT_LIST_GET_LEN(trx_sys->rw_trx_list) > 0) {
-    const trx_t *trx;
+    trx_sys->rw_trx_hash.iterate_no_dups(trx_undo_count_callback, &arg);
 
-    for (trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
-         trx = UT_LIST_GET_NEXT(trx_list, trx)) {
-      ut_ad(trx->is_recovered);
-      assert_trx_in_rw_list(trx);
-
-      if (trx_state_eq(trx, TRX_STATE_ACTIVE)) {
-        rows_to_undo += trx->undo_no;
-      }
-    }
-
+    rows_to_undo = arg.rows_to_undo;
     if (rows_to_undo > 1000000000) {
       unit = "M";
       rows_to_undo = rows_to_undo / 1000000;
     }
 
     ib::info(ER_IB_MSG_1198)
-        << UT_LIST_GET_LEN(trx_sys->rw_trx_list)
+        << trx_sys->rw_trx_hash.size()
         << " transaction(s) which must be rolled back or"
            " cleaned up in total "
         << rows_to_undo << unit << " row operations to undo";
 
-    ib::info(ER_IB_MSG_1199) << "Trx id counter is " << trx_sys->max_trx_id;
+    ib::info(ER_IB_MSG_1199) << "Trx id counter is " << trx_sys->get_max_trx_id();
   }
 
-  trx_sys->found_prepared_trx = trx_sys->n_prepared_trx > 0;
-
-  trx_sys_mutex_exit();
+  trx_sys->found_prepared_trx =
+      trx_sys->n_prepared_trx.load(std::memory_order_relaxed) > 0;
 
   return (purge_queue);
 }
@@ -508,20 +475,12 @@ void trx_sys_create(void) {
 
   mutex_create(LATCH_ID_TRX_SYS, &trx_sys->mutex);
 
-  UT_LIST_INIT(trx_sys->serialisation_list, &trx_t::no_list);
-  UT_LIST_INIT(trx_sys->rw_trx_list, &trx_t::trx_list);
   UT_LIST_INIT(trx_sys->mysql_trx_list, &trx_t::mysql_trx_list);
-
-  trx_sys->mvcc = UT_NEW_NOKEY(MVCC(1024));
-
-  trx_sys->min_active_id = 0;
 
   ut_d(trx_sys->rw_max_trx_no = 0);
 
-  new (&trx_sys->rw_trx_ids)
-      trx_ids_t(ut_allocator<trx_id_t>(mem_key_trx_sys_t_rw_trx_ids));
-
-  new (&trx_sys->rw_trx_set) TrxIdSet();
+  trx_sys->rw_trx_hash.init();
+  trx_sys->is_shutdown = false;
 
   new (&trx_sys->rsegs) Rsegs();
   trx_sys->rsegs.set_empty();
@@ -543,6 +502,20 @@ void trx_sys_create_sys_pages(void) {
 
 /*********************************************************************
 Shutdown/Close the transaction system. */
+static bool trx_free_prepared_or_active_recovered_callback(
+    rw_trx_hash_element_t *elem, void *arg) {
+  ut_ad(arg == nullptr);
+
+  mutex_enter(&elem->mutex);
+  trx_t *trx = elem->trx;
+  if (trx) {
+    trx_free_prepared_or_active_recovered(trx);
+    elem->trx = nullptr;
+  }
+  mutex_exit(&elem->mutex);
+  return false;
+}
+
 void trx_sys_close(void) {
   ut_ad(srv_shutdown_state.load() == SRV_SHUTDOWN_EXIT_THREADS);
 
@@ -550,7 +523,7 @@ void trx_sys_close(void) {
     return;
   }
 
-  ulint size = trx_sys->mvcc->size();
+  ulint size = trx_sys->view_count();
 
   if (size > 0) {
     ib::error(ER_IB_MSG_1201) << "All read views were not closed before"
@@ -558,6 +531,7 @@ void trx_sys_close(void) {
                               << size << " read views open";
   }
 
+  trx_sys->is_shutdown = true;
   sess_close(trx_dummy_sess);
   trx_dummy_sess = nullptr;
 
@@ -569,31 +543,20 @@ void trx_sys_close(void) {
   shutdown). Free all of them. */
   ut_d(trx_sys_after_background_threads_shutdown_validate());
 
-  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
-       trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list)) {
-    trx_free_prepared_or_active_recovered(trx);
-  }
+  trx_sys->rw_trx_hash.iterate(trx_free_prepared_or_active_recovered_callback);
 
   /* There can't be any active transactions. */
   trx_sys->rsegs.~Rsegs();
 
   trx_sys->tmp_rsegs.~Rsegs();
 
-  UT_DELETE(trx_sys->mvcc);
-
-  ut_a(UT_LIST_GET_LEN(trx_sys->rw_trx_list) == 0);
   ut_a(UT_LIST_GET_LEN(trx_sys->mysql_trx_list) == 0);
-  ut_a(UT_LIST_GET_LEN(trx_sys->serialisation_list) == 0);
+
+  trx_sys->rw_trx_hash.destroy();
 
   /* We used placement new to create this mutex. Call the destructor. */
   mutex_free(&trx_sys->mutex);
-
-  trx_sys->rw_trx_ids.~trx_ids_t();
-
-  trx_sys->rw_trx_set.~TrxIdSet();
-
   ut_free(trx_sys);
-
   trx_sys = nullptr;
 }
 
@@ -648,10 +611,9 @@ void trx_sys_after_pre_dd_shutdown_validate() {
     ut_a(active_recovered_trxs == 0);
   }
 
-  trx_sys_mutex_enter();
-  ut_a(UT_LIST_GET_LEN(trx_sys->rw_trx_list) ==
-       trx_sys->n_prepared_trx + active_recovered_trxs);
-  trx_sys_mutex_exit();
+  ut_a(trx_sys->rw_trx_hash.size() ==
+       trx_sys->n_prepared_trx.load(std::memory_order_relaxed)
+       + active_recovered_trxs);
 }
 
 void trx_sys_after_background_threads_shutdown_validate() {
@@ -662,53 +624,34 @@ void trx_sys_after_background_threads_shutdown_validate() {
   trx_sys_mutex_exit();
 }
 
+static bool recovered_active_count_callback(
+    rw_trx_hash_element_t *element, size_t *count) {
+  mutex_enter(&element->mutex);
+
+  if (trx_t *trx = element->trx) {
+    mutex_enter(&trx->mutex);
+
+    if (trx_state_eq(trx, TRX_STATE_ACTIVE)
+        && trx->is_recovered) {
+      ++*count;
+    }
+
+    mutex_exit(&trx->mutex);
+  }
+
+  mutex_exit(&element->mutex);
+  return false;
+}
+
 size_t trx_sys_recovered_active_trxs_count() {
   size_t total_trx = 0;
-  trx_sys_mutex_enter();
-  /* Recovered transactions are never citizens of mysql_trx_list,
-  so it's enough to check rw_trx_list. */
-  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
-       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
-    if (trx_state_eq(trx, TRX_STATE_ACTIVE) && trx->is_recovered) {
-      total_trx++;
-    }
-  }
-  trx_sys_mutex_exit();
+
+  trx_sys->rw_trx_hash.iterate_no_dups(recovered_active_count_callback,
+                                       &total_trx);
+
   return (total_trx);
 }
 
-#ifdef UNIV_DEBUG
-/** Validate the trx_ut_list_t.
- @return true if valid. */
-static bool trx_sys_validate_trx_list_low(
-    trx_ut_list_t *trx_list) /*!< in: &trx_sys->rw_trx_list */
-{
-  const trx_t *trx;
-  const trx_t *prev_trx = nullptr;
-
-  ut_ad(trx_sys_mutex_own());
-
-  ut_ad(trx_list == &trx_sys->rw_trx_list);
-
-  for (trx = UT_LIST_GET_FIRST(*trx_list); trx != nullptr;
-       prev_trx = trx, trx = UT_LIST_GET_NEXT(trx_list, prev_trx)) {
-    check_trx_state(trx);
-    ut_a(prev_trx == nullptr || prev_trx->id > trx->id);
-  }
-
-  return (true);
-}
-
-/** Validate the trx_sys_t::rw_trx_list.
- @return true if the list is valid. */
-bool trx_sys_validate_trx_list() {
-  ut_ad(trx_sys_mutex_own());
-
-  ut_a(trx_sys_validate_trx_list_low(&trx_sys->rw_trx_list));
-
-  return (true);
-}
-#endif /* UNIV_DEBUG */
 #endif /* !UNIV_HOTBACKUP */
 
 /** A list of undo tablespace IDs found in the TRX_SYS page. These are the

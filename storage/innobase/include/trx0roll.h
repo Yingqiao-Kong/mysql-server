@@ -64,10 +64,10 @@ trx_undo_rec_t *trx_roll_pop_top_rec_of_trx(
 /** Rollback or clean up any incomplete transactions which were
  encountered in crash recovery.  If the transaction already was
  committed, then we clean up a possible insert undo log. If the
- transaction was not yet committed, then we roll it back. */
-void trx_rollback_or_clean_recovered(
-    ibool all); /*!< in: FALSE=roll back dictionary transactions;
-                TRUE=roll back all non-PREPARED transactions */
+ transaction was not yet committed, then we roll it back.
+ @param all true=roll back all recovered active transactions;
+            false=roll back any incomplete dictionary transaction */
+void trx_rollback_recovered(ibool all);
 
 /** Rollback or clean up any incomplete transactions which were
 encountered in crash recovery.  If the transaction already was
