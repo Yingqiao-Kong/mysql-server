@@ -69,6 +69,9 @@ static ulint sg_count;
 #define sync_array_exit(a) mutex_exit(&(a)->mutex)
 #define sync_array_enter(a) mutex_enter(&(a)->mutex)
 
+#define sync_cell_exit(a) mutex_exit(&(a)->mutex)
+#define sync_cell_enter(a) mutex_enter(&(a)->mutex)
+
 #ifdef UNIV_DEBUG
 /** This function is called only in the debug version. Detects a deadlock
  of one or more threads because of waits of semaphores.
@@ -103,6 +106,18 @@ static void sync_array_validate(sync_array_t *arr) /*!< in: sync wait array */
   sync_array_exit(arr);
 }
 #endif /* UNIV_DEBUG */
+
+/** Constructor */
+sync_cell_t::sync_cell_t() UNIV_NOTHROW {
+  /* Initialize the mutex for this cell */
+  mutex_create(LATCH_ID_SYNC_CELL_MUTEX, &mutex);
+}
+
+/** Destructor */
+sync_cell_t::~sync_cell_t() UNIV_NOTHROW {
+  /* Free the mutex */
+  mutex_free(&mutex);
+}
 
 /** Constructor
 Creates a synchronization wait array. It is protected by a mutex
@@ -211,7 +226,9 @@ sync_cell_t *sync_array_reserve_cell(
   ut_ad(arr->next_free_slot <= arr->n_cells);
 
   ++arr->n_reserved;
+  sync_array_exit(arr);
 
+  sync_cell_enter(cell);
   /* Reserve the cell. */
   ut_ad(cell->latch.mutex == nullptr);
 
@@ -229,8 +246,7 @@ sync_cell_t *sync_array_reserve_cell(
 
   cell->file = file;
   cell->line = line;
-
-  sync_array_exit(arr);
+  sync_cell_exit(cell);
 
   cell->thread_id = std::this_thread::get_id();
 
@@ -250,14 +266,15 @@ void sync_array_free_cell(
     sync_array_t *arr,  /*!< in: wait array */
     sync_cell_t *&cell) /*!< in/out: the cell in the array */
 {
-  sync_array_enter(arr);
-
+  sync_cell_enter(cell);
   ut_a(cell->latch.mutex != nullptr);
 
   cell->waiting = false;
   cell->signal_count = 0;
   cell->latch.mutex = nullptr;
+  sync_cell_exit(cell);
 
+  sync_array_enter(arr);
   /* Setup the list of free slots in the array */
   cell->line = arr->first_free_slot;
 
@@ -292,8 +309,7 @@ void sync_array_wait_event(
     sync_array_t *arr,  /*!< in: wait array */
     sync_cell_t *&cell) /*!< in: index of the reserved cell */
 {
-  sync_array_enter(arr);
-
+  sync_cell_enter(cell);
   ut_ad(!cell->waiting);
   ut_ad(cell->latch.mutex);
   ut_ad(std::this_thread::get_id() == cell->thread_id);
@@ -321,7 +337,7 @@ void sync_array_wait_event(
 
   rw_lock_debug_mutex_exit();
 #endif /* UNIV_DEBUG */
-  sync_array_exit(arr);
+  sync_cell_exit(cell);
 
   os_event_wait_low(sync_cell_get_event(cell), cell->signal_count);
 
@@ -823,13 +839,12 @@ void sync_array_object_signalled() { ++sg_count; }
 static void sync_array_wake_threads_if_sema_free_low(
     sync_array_t *arr) /* in/out: wait array */
 {
-  sync_array_enter(arr);
-
   for (ulint i = 0; i < arr->next_free_slot; ++i) {
     sync_cell_t *cell;
 
     cell = sync_array_get_nth_cell(arr, i);
 
+    sync_cell_enter(cell);
     if (cell->latch.mutex != nullptr && sync_arr_cell_can_wake_up(cell)) {
       os_event_t event;
 
@@ -837,9 +852,8 @@ static void sync_array_wake_threads_if_sema_free_low(
 
       os_event_set(event);
     }
+    sync_cell_exit(cell);
   }
-
-  sync_array_exit(arr);
 }
 
 /** If the wakeup algorithm does not work perfectly at semaphore relases,
