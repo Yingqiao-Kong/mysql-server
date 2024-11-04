@@ -91,7 +91,15 @@ struct os_event {
     if (!m_set) {
       broadcast();
     }
+    mutex.exit();
+  }
 
+  void set_signal() UNIV_NOTHROW {
+    mutex.enter();
+
+    if(!m_set) {
+      signal();
+    }
     mutex.exit();
   }
 
@@ -115,12 +123,29 @@ struct os_event {
     if (m_set) {
       m_set = false;
     }
+    int64_t ret = signal_count;
+
+    mutex.exit();
+
+    return (ret);
+  }
+
+int64_t reset_sig() UNIV_NOTHROW {
+    mutex.enter();
 
     int64_t ret = signal_count;
 
     mutex.exit();
 
     return (ret);
+  }
+
+  void reset_mset() UNIV_NOTHROW {
+    mutex.enter();
+
+    m_set = false;
+
+    mutex.exit();
   }
 
   /**
@@ -141,6 +166,8 @@ struct os_event {
   value returned by reset() should be passed in as
   reset_sig_count. */
   void wait_low(int64_t reset_sig_count) UNIV_NOTHROW;
+
+  void wait_low_signal() UNIV_NOTHROW;
 
   /** Waits for an event object until it is in the signaled state or
   a timeout is exceeded.
@@ -211,6 +238,8 @@ struct os_event {
   /**
   Wakes one thread waiting for condition variable */
   void signal() UNIV_NOTHROW {
+    m_set = true;
+    ++signal_count;
 #ifdef _WIN32
     WakeConditionVariable(&cond_var);
 #else
@@ -367,6 +396,19 @@ void os_event::wait_low(int64_t reset_sig_count) UNIV_NOTHROW {
   }
 
   while (!m_set && signal_count == reset_sig_count) {
+    wait();
+
+    /* Spurious wakeups may occur: we have to check if the
+    event really has been signaled after we came here to wait. */
+  }
+
+  mutex.exit();
+}
+
+void os_event::wait_low_signal() UNIV_NOTHROW {
+  mutex.enter();
+
+  while (!m_set) {
     wait();
 
     /* Spurious wakeups may occur: we have to check if the
@@ -558,6 +600,11 @@ void os_event_set(os_event_t event) /*!< in/out: event to set */
   event->set();
 }
 
+void os_event_set_sig(os_event_t event)
+{
+  event->set_signal();
+}
+
 bool os_event_try_set(os_event_t event) { return (event->try_set()); }
 
 /**
@@ -573,6 +620,15 @@ int64_t os_event_reset(os_event_t event) /*!< in/out: event to reset */
   return (event->reset());
 }
 
+int64_t os_event_reset_sig(os_event_t event)
+{
+  return (event->reset_sig());
+}
+
+void os_event_reset_mset(os_event_t event)
+{
+  event->reset_mset();
+}
 /**
 Waits for an event object until it is in the signaled state or
 a timeout is exceeded.
@@ -600,6 +656,11 @@ void os_event_wait_low(os_event_t event,        /*!< in: event to wait */
                                                 os_event_reset(). */
 {
   event->wait_low(reset_sig_count);
+}
+
+void os_event_wait_low_signal(os_event_t event)
+{
+  event->wait_low_signal();
 }
 
 /**

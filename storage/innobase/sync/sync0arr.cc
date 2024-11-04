@@ -339,7 +339,7 @@ void sync_array_wait_event(
 #endif /* UNIV_DEBUG */
   sync_cell_exit(cell);
 
-  os_event_wait_low(sync_cell_get_event(cell), cell->signal_count);
+  os_event_wait_low_signal(sync_cell_get_event(cell));
 
   sync_array_free_cell(arr, cell);
 

@@ -352,7 +352,7 @@ struct TTASEventMutex {
   typedef Policy<TTASEventMutex> MutexPolicy;
 
   TTASEventMutex() UNIV_NOTHROW : m_lock_word(MUTEX_STATE_UNLOCKED),
-                                  m_waiters(),
+                                  m_waiters(0),
                                   m_event() {
     /* Check that lock_word is aligned. */
     ut_ad(!((ulint)&m_lock_word % sizeof(ulint)));
@@ -533,8 +533,12 @@ struct TTASEventMutex {
   /** Note that there are threads waiting on the mutex */
   void set_waiters() UNIV_NOTHROW { m_waiters.store(true); }
 
+  void add_waiters() UNIV_NOTHROW { m_waiters.fetch_add(1); }
+
   /** Note that there are no threads waiting on the mutex */
   void clear_waiters() UNIV_NOTHROW { m_waiters.store(false); }
+
+  void sub_waiters() UNIV_NOTHROW { m_waiters.fetch_sub(1); }
 
   /** Wakeup any waiting thread(s). */
   void signal() UNIV_NOTHROW;
@@ -552,7 +556,7 @@ struct TTASEventMutex {
 
   /** true if there are (or may be) threads waiting
   in the global wait array for this mutex to be released. */
-  std::atomic_bool m_waiters;
+  std::atomic_int m_waiters;
 
   /** Used by sync0arr.cc for the wait queue */
   os_event_t m_event;
