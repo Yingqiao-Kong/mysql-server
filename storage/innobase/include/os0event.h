@@ -58,7 +58,6 @@ os_event_t os_event_create();
 Sets an event semaphore to the signaled state: lets waiting threads
 proceed. */
 void os_event_set(os_event_t event); /*!< in/out: event to set */
-void os_event_set_sig(os_event_t event);
 
 bool os_event_try_set(os_event_t event);
 
@@ -75,8 +74,6 @@ that this thread should not wait in case of an intervening call to
 os_event_set() between this os_event_reset() and the
 os_event_wait_low() call. See comments for os_event_wait_low(). */
 int64_t os_event_reset(os_event_t event); /*!< in/out: event to reset */
-int64_t os_event_reset_sig(os_event_t event);
-void os_event_reset_mset(os_event_t event);
 
 /**
 Frees an event object. */
@@ -103,8 +100,6 @@ void os_event_wait_low(os_event_t event,         /*!< in/out: event to wait */
                        int64_t reset_sig_count); /*!< in: zero or the value
                                                 returned by previous call of
                                                 os_event_reset(). */
-
-void os_event_wait_low_signal(os_event_t event);
 
 /** Blocking infinite wait on an event, until signealled.
 @param e - event to wait on. */
