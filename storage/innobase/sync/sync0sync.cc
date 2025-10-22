@@ -133,7 +133,6 @@ mysql_pfs_key_t srv_threads_mutex_key;
 mysql_pfs_key_t event_mutex_key;
 mysql_pfs_key_t event_manager_mutex_key;
 #endif /* !PFS_SKIP_EVENT_MUTEX */
-mysql_pfs_key_t sync_cell_mutex_key;
 mysql_pfs_key_t sync_array_mutex_key;
 mysql_pfs_key_t zip_pad_mutex_key;
 mysql_pfs_key_t row_drop_list_mutex_key;

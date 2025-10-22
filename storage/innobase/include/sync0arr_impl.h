@@ -111,7 +111,7 @@ struct sync_cell_t {
 
   /** Time when the thread reserved the wait cell. */
   ib_time_monotonic_t reservation_time = 0;
-  SysMutex mutex;
+  OSMutex mutex;
 };
 
 /* NOTE: It is allowed for a thread to wait for an event allocated for
@@ -157,8 +157,6 @@ extern sync_array_t **sync_wait_array;
 
 #define sync_array_exit(a) mutex_exit(&(a)->mutex)
 #define sync_array_enter(a) mutex_enter(&(a)->mutex)
-#define sync_cell_exit(a) mutex_exit(&(a)->mutex)
-#define sync_cell_enter(a) mutex_enter(&(a)->mutex)
 
 /** Gets the nth cell in array.
  @param[in] arr Sync array to get cell from.

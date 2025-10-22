@@ -66,12 +66,6 @@ sync_array_t **sync_wait_array;
 /** count of how many times an object has been signalled */
 static ulint sg_count;
 
-#define sync_array_exit(a) mutex_exit(&(a)->mutex)
-#define sync_array_enter(a) mutex_enter(&(a)->mutex)
-
-#define sync_cell_exit(a) mutex_exit(&(a)->mutex)
-#define sync_cell_enter(a) mutex_enter(&(a)->mutex)
-
 #ifdef UNIV_DEBUG
 /** This function is called only in the debug version. Detects a deadlock
  of one or more threads because of waits of semaphores.
@@ -110,13 +104,13 @@ static void sync_array_validate(sync_array_t *arr) /*!< in: sync wait array */
 /** Constructor */
 sync_cell_t::sync_cell_t() UNIV_NOTHROW {
   /* Initialize the mutex for this cell */
-  mutex_create(LATCH_ID_SYNC_CELL_MUTEX, &mutex);
+  mutex.init();
 }
 
 /** Destructor */
 sync_cell_t::~sync_cell_t() UNIV_NOTHROW {
   /* Free the mutex */
-  mutex_free(&mutex);
+  mutex.destroy();
 }
 
 /** Constructor
@@ -228,7 +222,7 @@ sync_cell_t *sync_array_reserve_cell(
   ++arr->n_reserved;
   sync_array_exit(arr);
 
-  sync_cell_enter(cell);
+  cell->mutex.enter();
   /* Reserve the cell. */
   ut_ad(cell->latch.mutex == nullptr);
 
@@ -246,7 +240,7 @@ sync_cell_t *sync_array_reserve_cell(
 
   cell->file = file;
   cell->line = line;
-  sync_cell_exit(cell);
+  cell->mutex.exit();
 
   cell->thread_id = std::this_thread::get_id();
 
@@ -266,13 +260,13 @@ void sync_array_free_cell(
     sync_array_t *arr,  /*!< in: wait array */
     sync_cell_t *&cell) /*!< in/out: the cell in the array */
 {
-  sync_cell_enter(cell);
+  cell->mutex.enter();
   ut_a(cell->latch.mutex != nullptr);
 
   cell->waiting = false;
   cell->signal_count = 0;
   cell->latch.mutex = nullptr;
-  sync_cell_exit(cell);
+  cell->mutex.exit();
 
   sync_array_enter(arr);
   /* Setup the list of free slots in the array */
@@ -309,15 +303,16 @@ void sync_array_wait_event(
     sync_array_t *arr,  /*!< in: wait array */
     sync_cell_t *&cell) /*!< in: index of the reserved cell */
 {
-  sync_cell_enter(cell);
+  cell->mutex.enter();
   ut_ad(!cell->waiting);
   ut_ad(cell->latch.mutex);
   ut_ad(std::this_thread::get_id() == cell->thread_id);
 
   cell->waiting = true;
+  cell->mutex.exit();
 
 #ifdef UNIV_DEBUG
-
+  sync_array_enter(arr);
   /* We use simple enter to the mutex below, because if
   we cannot acquire it at once, mutex_enter would call
   recursively sync_array routines, leading to trouble.
@@ -336,8 +331,8 @@ void sync_array_wait_event(
   }
 
   rw_lock_debug_mutex_exit();
+  sync_array_exit(arr);
 #endif /* UNIV_DEBUG */
-  sync_cell_exit(cell);
 
   os_event_wait_low(sync_cell_get_event(cell), cell->signal_count);
 
@@ -351,6 +346,7 @@ void sync_array_cell_print(FILE *file, sync_cell_t *cell) {
   ulint type;
   ulint writer;
 
+  cell->mutex.enter();
   type = cell->request_type;
 
   fprintf(file,
@@ -454,6 +450,7 @@ void sync_array_cell_print(FILE *file, sync_cell_t *cell) {
   if (!cell->waiting) {
     fputs("wait has ended\n", file);
   }
+  cell->mutex.exit();
 }
 
 #ifdef UNIV_DEBUG
@@ -541,17 +538,18 @@ static bool sync_array_detect_deadlock(
   ibool ret;
   rw_lock_debug_t *debug;
 
+  cell->mutex.enter();
   ut_a(arr);
   ut_a(start);
   ut_a(cell);
-  ut_ad(cell->latch.mutex != nullptr);
   ut_ad(start->thread_id == std::this_thread::get_id());
   ut_ad(depth < 100);
 
   depth++;
 
-  if (!cell->waiting) {
+  if (!cell->waiting || cell->latch.mutex == nullptr) {
     /* No deadlock here */
+    cell->mutex.exit();
     return (false);
   }
 
@@ -559,6 +557,7 @@ static bool sync_array_detect_deadlock(
     case SYNC_MUTEX: {
       WaitMutex *mutex = cell->latch.mutex;
       const WaitMutex::MutexPolicy &policy = mutex->policy();
+      cell->mutex.exit();
 
       if (mutex->state() != MUTEX_STATE_UNLOCKED) {
         thread = policy.get_thread_id();
@@ -606,8 +605,8 @@ static bool sync_array_detect_deadlock(
 
     case SYNC_BUF_BLOCK: {
       BlockWaitMutex *mutex = cell->latch.bpmutex;
-
       const BlockWaitMutex::MutexPolicy &policy = mutex->policy();
+      cell->mutex.exit();
 
       if (mutex->state() != MUTEX_STATE_UNLOCKED) {
         thread = policy.get_thread_id();
@@ -656,6 +655,7 @@ static bool sync_array_detect_deadlock(
     case RW_LOCK_X_WAIT:
 
       lock = cell->latch.lock;
+      cell->mutex.exit();
 
       for (debug = UT_LIST_GET_FIRST(lock->debug_list); debug != nullptr;
            debug = UT_LIST_GET_NEXT(list, debug)) {
@@ -693,6 +693,7 @@ static bool sync_array_detect_deadlock(
     case RW_LOCK_SX:
 
       lock = cell->latch.lock;
+      cell->mutex.exit();
 
       for (debug = UT_LIST_GET_FIRST(lock->debug_list); debug != nullptr;
            debug = UT_LIST_GET_NEXT(list, debug)) {
@@ -727,6 +728,7 @@ static bool sync_array_detect_deadlock(
     case RW_LOCK_S:
 
       lock = cell->latch.lock;
+      cell->mutex.exit();
 
       for (debug = UT_LIST_GET_FIRST(lock->debug_list); debug != nullptr;
            debug = UT_LIST_GET_NEXT(list, debug)) {
@@ -752,6 +754,7 @@ static bool sync_array_detect_deadlock(
       return (false);
 
     default:
+      cell->mutex.exit();
       ut_error;
   }
 
@@ -844,7 +847,7 @@ static void sync_array_wake_threads_if_sema_free_low(
 
     cell = sync_array_get_nth_cell(arr, i);
 
-    sync_cell_enter(cell);
+    cell->mutex.enter();
     if (cell->latch.mutex != nullptr && sync_arr_cell_can_wake_up(cell)) {
       os_event_t event;
 
@@ -852,7 +855,7 @@ static void sync_array_wake_threads_if_sema_free_low(
 
       os_event_set(event);
     }
-    sync_cell_exit(cell);
+    cell->mutex.exit();
   }
 }
 
