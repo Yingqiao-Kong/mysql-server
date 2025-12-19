@@ -10984,6 +10984,7 @@ PSI_mutex_key key_LOCK_tc;
 PSI_mutex_key key_hash_filo_lock;
 PSI_mutex_key key_LOCK_error_log;
 PSI_mutex_key key_LOCK_thd_data;
+PSI_mutex_key key_LOCK_commit_done;
 PSI_mutex_key key_LOCK_thd_sysvar;
 PSI_mutex_key key_LOCK_thd_protocol;
 PSI_mutex_key key_LOG_LOCK_log;
@@ -11063,6 +11064,7 @@ static PSI_mutex_info all_server_mutexes[]=
 #endif
   { &key_LOCK_status, "LOCK_status", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
   { &key_LOCK_thd_data, "THD::LOCK_thd_data", 0, PSI_VOLATILITY_SESSION, PSI_DOCUMENT_ME},
+  { &key_LOCK_commit_done, "THD:LOCK_commit_done", 0, PSI_VOLATILITY_SESSION, PSI_DOCUMENT_ME},
   { &key_LOCK_thd_query, "THD::LOCK_thd_query", 0, PSI_VOLATILITY_SESSION, PSI_DOCUMENT_ME},
   { &key_LOCK_thd_sysvar, "THD::LOCK_thd_sysvar", 0, PSI_VOLATILITY_SESSION, PSI_DOCUMENT_ME},
   { &key_LOCK_thd_protocol, "THD::LOCK_thd_protocol", 0, PSI_VOLATILITY_SESSION, PSI_DOCUMENT_ME},
@@ -11174,6 +11176,8 @@ PSI_cond_key key_cond_mts_gaq;
 PSI_cond_key key_RELAYLOG_update_cond;
 PSI_cond_key key_gtid_ensure_index_cond;
 PSI_cond_key key_COND_thr_lock;
+PSI_cond_key key_COND_commit_done;
+PSI_cond_key key_COND_commit_order;
 PSI_cond_key key_commit_order_manager_cond;
 PSI_cond_key key_cond_slave_worker_hash;
 PSI_cond_key key_monitor_info_run_cond;
@@ -11199,6 +11203,8 @@ static PSI_cond_info all_server_conds[]=
   { &key_COND_start_signal_handler, "COND_start_signal_handler", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
 #endif
   { &key_COND_thr_lock, "COND_thr_lock", 0, 0, PSI_DOCUMENT_ME},
+  { &key_COND_commit_done, "COND_commit_done", 0, 0, PSI_DOCUMENT_ME},
+  { &key_COND_commit_order, "COND_commit_order", 0, 0, PSI_DOCUMENT_ME},
   { &key_item_func_sleep_cond, "Item_func_sleep::cond", 0, 0, PSI_DOCUMENT_ME},
   { &key_master_info_data_cond, "Master_info::data_cond", 0, 0, PSI_DOCUMENT_ME},
   { &key_master_info_start_cond, "Master_info::start_cond", 0, 0, PSI_DOCUMENT_ME},

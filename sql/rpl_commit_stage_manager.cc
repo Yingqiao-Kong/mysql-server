@@ -256,25 +256,28 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
   */
   if (!leader) {
     CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_follower_wait");
-    mysql_mutex_lock(&m_lock_done);
 #ifndef NDEBUG
     /*
       Leader can be awaiting all-clear to preempt follower's execution.
       With setting the status the follower ensures it won't execute anything
       including thread-specific code.
     */
+    mysql_mutex_lock(&m_lock_done);
     thd->get_transaction()->m_flags.ready_preempt = 1;
     if (leader_await_preempt_status) mysql_cond_signal(&m_cond_preempt);
+    mysql_mutex_unlock(&m_lock_done);
 #endif
+
+    mysql_mutex_lock(&thd->LOCK_commit_done);
     while (thd->tx_commit_pending) {
       if (stage == COMMIT_ORDER_FLUSH_STAGE) {
-        mysql_cond_wait(&m_stage_cond_commit_order, &m_lock_done);
+        mysql_cond_wait(&thd->COND_commit_order, &thd->LOCK_commit_done);
       } else {
-        mysql_cond_wait(&m_stage_cond_binlog, &m_lock_done);
+        mysql_cond_wait(&thd->COND_commit_done, &thd->LOCK_commit_done);
       }
     }
+    mysql_mutex_unlock(&thd->LOCK_commit_done);
 
-    mysql_mutex_unlock(&m_lock_done);
     return false;
   }
 
@@ -312,13 +315,13 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
       mysql_cond_signal(&m_stage_cond_leader);
       unlock_queue(stage);
 
-      mysql_mutex_lock(&m_lock_done);
+      mysql_mutex_lock(&thd->LOCK_commit_done);
       /* wait for signal from binlog leader */
       CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP(
           "before_commit_order_leader_waits_for_binlog_leader");
       while (thd->tx_commit_pending)
-        mysql_cond_wait(&m_stage_cond_commit_order, &m_lock_done);
-      mysql_mutex_unlock(&m_lock_done);
+        mysql_cond_wait(&thd->COND_commit_order, &thd->LOCK_commit_done);
+      mysql_mutex_unlock(&thd->LOCK_commit_done);
 
       leader = false;
       return leader;
@@ -400,19 +403,22 @@ void Commit_stage_manager::process_final_stage_for_ordered_commit_group(
 }
 
 void Commit_stage_manager::signal_done(THD *queue, StageID stage) {
-  mysql_mutex_lock(&m_lock_done);
-
+  std::vector<THD *> group;
   for (THD *thd = queue; thd; thd = thd->next_to_commit) {
-    thd->tx_commit_pending = false;
+    group.push_back(thd);
   }
 
-  /* if thread belong to commit order wake only commit order queue threads */
-  if (stage == COMMIT_ORDER_FLUSH_STAGE)
-    mysql_cond_broadcast(&m_stage_cond_commit_order);
-  else
-    mysql_cond_broadcast(&m_stage_cond_binlog);
+  for (THD *thd : group) {
+    mysql_mutex_lock(&thd->LOCK_commit_done);
+    thd->tx_commit_pending = false;
 
-  mysql_mutex_unlock(&m_lock_done);
+    if (stage == COMMIT_ORDER_FLUSH_STAGE)
+      mysql_cond_signal(&thd->COND_commit_order);
+    else
+      mysql_cond_signal(&thd->COND_commit_done);
+
+    mysql_mutex_unlock(&thd->LOCK_commit_done);
+  }
 }
 
 #ifndef NDEBUG

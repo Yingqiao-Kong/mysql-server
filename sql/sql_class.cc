@@ -519,6 +519,10 @@ THD::THD(bool enable_plugins)
                    MY_MUTEX_INIT_FAST);
   mysql_cond_init(key_COND_thr_lock, &COND_thr_lock);
 
+  mysql_mutex_init(key_LOCK_commit_done, &LOCK_commit_done, MY_MUTEX_INIT_FAST);
+  mysql_cond_init(key_COND_commit_done, &COND_commit_done);
+  mysql_cond_init(key_COND_commit_order, &COND_commit_order);
+
   /* Variables with default values */
   proc_info = "login";
   where = THD::DEFAULT_WHERE;
@@ -1114,6 +1118,9 @@ THD::~THD() {
   mysql_mutex_destroy(&LOCK_thd_protocol);
   mysql_mutex_destroy(&LOCK_current_cond);
   mysql_cond_destroy(&COND_thr_lock);
+  mysql_mutex_destroy(&LOCK_commit_done);
+  mysql_cond_destroy(&COND_commit_done);
+  mysql_cond_destroy(&COND_commit_order);
 #ifndef NDEBUG
   dbug_sentry = THD_SENTRY_GONE;
 #endif

@@ -1069,6 +1069,22 @@ class THD : public MDL_context_owner,
   mysql_mutex_t LOCK_thd_protocol;
 
   /**
+    Protects THD::COND_commit_done and THD::COND_commit_order when entering
+    and exiting sleep status during group commit.
+  */
+  mysql_mutex_t LOCK_commit_done;
+
+  /**
+    Used to enter and exit sleep status during group commit as a follower.
+  */
+  mysql_cond_t COND_commit_done;
+
+  /**
+    Used to enter and exit sleep status during group commit as a commit order thread.
+  */
+  mysql_cond_t COND_commit_order;
+
+  /**
     Protects query plan (SELECT/UPDATE/DELETE's) from being freed/changed
     while another thread explains it. Following structures are protected by
     this mutex:
