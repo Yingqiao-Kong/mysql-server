@@ -151,17 +151,17 @@ class Global_THD_manager {
     Retrieves thread running statistic variable.
     @return int Returns the total number of threads currently running
   */
-  int get_num_thread_running() const { return atomic_num_thread_running; }
+  int get_num_thread_running();
 
   /**
     Increments thread running statistic variable.
   */
-  void inc_thread_running() { atomic_num_thread_running++; }
+  void inc_thread_running(THD *thd) const;
 
   /**
     Decrements thread running statistic variable.
   */
-  void dec_thread_running() { atomic_num_thread_running--; }
+  void dec_thread_running(THD *thd) const;
 
   /**
     Retrieves thread created statistic variable.

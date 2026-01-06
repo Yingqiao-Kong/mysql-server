@@ -859,6 +859,7 @@ class THD : public MDL_context_owner,
   ulong want_privilege;
 
  private:
+  std::atomic<bool> is_running;
   /**
     The lex to hold the parsed tree of conventional (non-prepared) queries.
     Whereas for prepared and stored procedure statements we use an own lex
@@ -872,6 +873,14 @@ class THD : public MDL_context_owner,
   dd::cache::Dictionary_client *dd_client() const  // Get the dictionary client.
   {
     return m_dd_client.get();
+  }
+
+  void set_is_running(bool running) {
+    is_running = running;
+  }
+
+  bool get_is_running() const {
+    return is_running;
   }
 
  private:

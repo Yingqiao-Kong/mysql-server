@@ -767,7 +767,8 @@ void btr_cur_search_to_nth_level(
 #endif
   /* Use of AHI is disabled for intrinsic table as these tables re-use
   the index-id and AHI validation is based on index-id. */
-  if (rw_lock_get_writer(btr_get_search_latch(index)) == RW_LOCK_NOT_LOCKED &&
+  if (btr_search_enabled) {
+    if (rw_lock_get_writer(btr_get_search_latch(index)) == RW_LOCK_NOT_LOCKED &&
       latch_mode <= BTR_MODIFY_LEAF && info->last_hash_succ &&
       !index->disable_ahi && !estimate
 #ifdef PAGE_CUR_LE_OR_EXTENDS
@@ -781,16 +782,17 @@ void btr_cur_search_to_nth_level(
       btr_search_guess_on_hash(index, info, tuple, mode, latch_mode, cursor,
                                has_search_latch, mtr)) {
 
-    /* Search using the hash index succeeded */
+      /* Search using the hash index succeeded */
 
-    ut_ad(cursor->up_match != ULINT_UNDEFINED || mode != PAGE_CUR_GE);
-    ut_ad(cursor->up_match != ULINT_UNDEFINED || mode != PAGE_CUR_LE);
-    ut_ad(cursor->low_match != ULINT_UNDEFINED || mode != PAGE_CUR_LE);
-    btr_cur_n_sea++;
+      ut_ad(cursor->up_match != ULINT_UNDEFINED || mode != PAGE_CUR_GE);
+      ut_ad(cursor->up_match != ULINT_UNDEFINED || mode != PAGE_CUR_LE);
+      ut_ad(cursor->low_match != ULINT_UNDEFINED || mode != PAGE_CUR_LE);
+      btr_cur_n_sea++;
 
-    return;
+      return;
+    }
+    btr_cur_n_non_sea++;
   }
-  btr_cur_n_non_sea++;
   DBUG_EXECUTE_IF("non_ahi_search",
                   assert(!strcmp(index->table->name.m_name, "test/t1")););
 

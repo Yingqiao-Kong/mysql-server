@@ -233,6 +233,28 @@ my_thread_id Global_THD_manager::get_new_thread_id() {
   return new_id;
 }
 
+int Global_THD_manager::get_num_thread_running() {
+  int num = 0;
+  for (int i = 0; i < NUM_PARTITIONS; i++) {
+    mysql_mutex_lock(&LOCK_thd_list[i]);
+    for (size_t j = 0; j < thd_list[i].size(); j++) {
+      if (thd_list[i][j]->get_is_running()) {
+        num++;
+      }
+    }
+    mysql_mutex_unlock(&LOCK_thd_list[i]);
+  }
+  return num;
+}
+
+void Global_THD_manager::inc_thread_running(THD *thd) const {
+  thd->set_is_running(true);
+}
+
+void Global_THD_manager::dec_thread_running(THD *thd) const {
+  thd->set_is_running(false);
+}
+
 void Global_THD_manager::release_thread_id(my_thread_id thread_id) {
   if (thread_id == reserved_thread_id)
     return;  // Some temporary THDs are never given a proper ID.
