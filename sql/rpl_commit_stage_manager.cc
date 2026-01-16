@@ -403,21 +403,26 @@ void Commit_stage_manager::process_final_stage_for_ordered_commit_group(
 }
 
 void Commit_stage_manager::signal_done(THD *queue, StageID stage) {
-  std::vector<THD *> group;
-  for (THD *thd = queue; thd; thd = thd->next_to_commit) {
-    group.push_back(thd);
-  }
+  THD *cur = queue;
+  THD *next = nullptr;
 
-  for (THD *thd : group) {
-    mysql_mutex_lock(&thd->LOCK_commit_done);
-    thd->tx_commit_pending = false;
+  while (cur) {
+    /*
+      Fetch next pointer before wake cur, since cur may quit or be reused before we fetch its next_to_commit.
+    */
+    next = cur->next_to_commit;
+
+    mysql_mutex_lock(&cur->LOCK_commit_done);
+    cur->tx_commit_pending = false;
 
     if (stage == COMMIT_ORDER_FLUSH_STAGE)
-      mysql_cond_signal(&thd->COND_commit_order);
+      mysql_cond_signal(&cur->COND_commit_order);
     else
-      mysql_cond_signal(&thd->COND_commit_done);
+      mysql_cond_signal(&cur->COND_commit_done);
 
-    mysql_mutex_unlock(&thd->LOCK_commit_done);
+    mysql_mutex_unlock(&cur->LOCK_commit_done);
+
+    cur = next;
   }
 }
 
