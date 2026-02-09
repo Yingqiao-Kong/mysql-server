@@ -55,6 +55,9 @@ typedef enum {
   SLAVE_THD_MONITOR
 } SLAVE_THD_TYPE;
 
+extern bool g_slave_mysqld;
+extern bool g_thd_numa_bin_log_switch_initialized;
+
 /**
   MASTER_DELAY can be at most (1 << 31) - 1.
 */

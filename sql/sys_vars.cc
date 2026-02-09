@@ -2398,6 +2398,22 @@ static Sys_var_bool Sys_log_bin_use_v1_row_events(
     NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_log_bin_use_v1_row_events),
     ON_UPDATE(nullptr), DEPRECATED_VAR(""));
 
+/*bin log numa variables begin*/
+static Sys_var_bool Sys_numa_bin_log(
+    "numa_bin_log",
+    "bin log grouping by numa node",
+    READ_ONLY GLOBAL_VAR(opt_numa_bin_log),
+    CMD_LINE(OPT_ARG), DEFAULT(true));
+
+static Sys_var_bool Sys_numa_bin_log_skip_sync(
+    "numa_bin_log_skip_sync",
+    "bin log grouping by numa node, multi numa node leader wait in sync stage,"
+    "pre sync including others node, if the queue length is same from pre sync to current,"
+    "we can skip this node sync",
+    READ_ONLY GLOBAL_VAR(opt_numa_bin_log_skip_sync),
+    CMD_LINE(OPT_ARG), DEFAULT(true));
+/*bin log numa variables end*/
+
 static Sys_var_charptr Sys_log_error(
     "log_error", "Error log file",
     READ_ONLY NON_PERSIST GLOBAL_VAR(log_error_dest),

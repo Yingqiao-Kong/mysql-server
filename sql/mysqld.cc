@@ -1140,6 +1140,10 @@ LEX_STRING opt_mandatory_roles;
 bool opt_mandatory_roles_cache = false;
 bool opt_always_activate_granted_roles = false;
 bool opt_bin_log;
+/*bin log numa variables begin*/
+bool opt_numa_bin_log = false;
+bool opt_numa_bin_log_skip_sync = false;
+/*bin log numa variables end*/
 bool opt_general_log, opt_slow_log, opt_general_log_raw;
 ulonglong log_output_options;
 bool opt_log_queries_not_using_indexes = false;

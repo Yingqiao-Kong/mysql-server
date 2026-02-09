@@ -145,6 +145,7 @@ class MYSQL_BIN_LOG : public TC_LOG {
  private:
   enum enum_log_state { LOG_OPENED, LOG_CLOSED, LOG_TO_BE_OPENED };
 
+  mysql_mutex_t LOCK_thread_num;
   /* LOCK_log is inited by init_pthread_objects() */
   mysql_mutex_t LOCK_log;
   char *name;

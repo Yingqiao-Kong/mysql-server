@@ -28,8 +28,15 @@
 #include "sql/rpl_rli_pdb.h"  // Slave_worker                    // Slave_worker
 #include "sql/rpl_slave_commit_order_manager.h"  // Commit_order_manager
 
+#include "sql/mysqld.h"
+#include "mysql/components/services/log_builtins.h"
 class Slave_worker;
 class Commit_order_manager;
+
+int g_max_numa_num = 0;
+bool g_binlog_numa_initialized = false;
+thread_local int thread_numa_id = 0;
+thread_local bool thd_numa_bin_log_switch = false;
 
 #define YESNO(X) ((X) ? "yes" : "no")
 
@@ -129,6 +136,44 @@ void Commit_stage_manager::init(PSI_mutex_key key_LOCK_flush_queue,
   m_queue[SYNC_STAGE].init(&m_queue_lock[SYNC_STAGE]);
   m_queue[COMMIT_STAGE].init(&m_queue_lock[COMMIT_STAGE]);
   m_queue[COMMIT_ORDER_FLUSH_STAGE].init(&m_queue_lock[BINLOG_FLUSH_STAGE]);
+
+  if(!g_binlog_numa_initialized){
+    return;
+  }
+  if(g_max_numa_num <= 0){
+    g_binlog_numa_initialized = false;
+    return;
+  }
+
+  try {
+    m_numa_queue = new Mutex_queue[g_max_numa_num][STAGE_COUNTER];
+  } catch (const std::bad_alloc&) {
+    g_binlog_numa_initialized = false;
+    return;
+  }
+
+  m_numa_queue_lock = (mysql_mutex_t (*)[STAGE_COUNTER-1])malloc(
+           g_max_numa_num * sizeof(mysql_mutex_t[STAGE_COUNTER-1])
+  );
+  if (m_numa_queue_lock == NULL) {
+    delete[] m_numa_queue;
+    m_numa_queue = nullptr;
+    g_binlog_numa_initialized = false;
+    return;
+  }
+
+  for (int j = 0; j < g_max_numa_num; j++) {
+    mysql_mutex_init(key_LOCK_flush_queue, &m_numa_queue_lock[j][BINLOG_FLUSH_STAGE],
+                     MY_MUTEX_INIT_FAST);
+    mysql_mutex_init(key_LOCK_sync_queue, &m_numa_queue_lock[j][SYNC_STAGE],
+                     MY_MUTEX_INIT_FAST);
+    mysql_mutex_init(key_LOCK_commit_queue, &m_numa_queue_lock[j][COMMIT_STAGE],
+                     MY_MUTEX_INIT_FAST);
+    m_numa_queue[j][BINLOG_FLUSH_STAGE].init(&m_numa_queue_lock[j][BINLOG_FLUSH_STAGE]);
+    m_numa_queue[j][SYNC_STAGE].init(&m_numa_queue_lock[j][SYNC_STAGE]);
+    m_numa_queue[j][COMMIT_STAGE].init(&m_numa_queue_lock[j][COMMIT_STAGE]);
+    m_numa_queue[j][COMMIT_ORDER_FLUSH_STAGE].init(&m_numa_queue_lock[j][BINLOG_FLUSH_STAGE]);
+  }
 }
 
 void Commit_stage_manager::deinit() {
@@ -137,6 +182,18 @@ void Commit_stage_manager::deinit() {
 
   for (size_t i = 0; i < STAGE_COUNTER - 1; ++i)
     mysql_mutex_destroy(&m_queue_lock[i]);
+
+  if(g_binlog_numa_initialized){
+    for (int j = 0; j < g_max_numa_num; j++) {
+       for (size_t i = 0; i < STAGE_COUNTER - 1; ++i){
+           mysql_mutex_destroy(&m_numa_queue_lock[j][i]);
+       }
+    }
+    free(m_numa_queue_lock);
+    m_numa_queue_lock = nullptr;
+    delete[] m_numa_queue;
+    m_numa_queue = nullptr;
+  }
   mysql_cond_destroy(&m_stage_cond_binlog);
   mysql_cond_destroy(&m_stage_cond_commit_order);
   mysql_cond_destroy(&m_stage_cond_leader);
@@ -152,8 +209,16 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
   DBUG_PRINT("debug",
              ("Enqueue 0x%llx to queue for stage %d", (ulonglong)thd, stage));
 
-  lock_queue(stage);
-  bool leader = m_queue[stage].append(thd);
+  int numa_id = 0;
+  bool leader = false;
+  if(thd_numa_bin_log_switch){
+    numa_id = thd->thd_numa_id;
+    lock_numa_queue(stage, numa_id);
+    leader = m_numa_queue[numa_id][stage].append(thd);
+  }else{
+    lock_queue(stage);
+    leader = m_queue[stage].append(thd);
+  }
 
   /*
    if its FLUSH stage queue (BINLOG_FLUSH_STAGE or COMMIT_ORDER_FLUSH_STAGE)
@@ -198,7 +263,11 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
     }
   }
 
-  unlock_queue(stage);
+  if(thd_numa_bin_log_switch){
+    unlock_numa_queue(stage, numa_id);
+  }else{
+    unlock_queue(stage);
+  }
 
   /* Notify next transaction in commit order that it can enter the queue. */
   if (stage == BINLOG_FLUSH_STAGE) {
@@ -373,14 +442,27 @@ void Commit_stage_manager::wait_count_or_timeout(ulong count, long usec,
   long delta = DBUG_EVALUATE_IF("bgc_set_infinite_delay", 100000,
                                 std::max<long>(1, (to_wait * 0.1)));
 
-  while (
-      to_wait > 0 &&
-      (count == 0 || static_cast<ulong>(m_queue[stage].get_size()) < count)) {
+  if(thd_numa_bin_log_switch){
+     int numa_id = thread_numa_id;
+      while (
+          to_wait > 0 &&
+          (count == 0 || static_cast<ulong>(m_numa_queue[numa_id][stage].get_size()) < count)) {
 #ifndef NDEBUG
-    if (current_thd) DEBUG_SYNC(current_thd, "bgc_wait_count_or_timeout");
+      if (current_thd) DEBUG_SYNC(current_thd, "bgc_wait_count_or_timeout");
 #endif
-    my_sleep(delta);
-    to_wait -= delta;
+       my_sleep(delta);
+       to_wait -= delta;
+     }
+  }else{
+     while (
+         to_wait > 0 &&
+         (count == 0 || static_cast<ulong>(m_queue[stage].get_size()) < count)) {
+#ifndef NDEBUG
+       if (current_thd) DEBUG_SYNC(current_thd, "bgc_wait_count_or_timeout");
+#endif
+       my_sleep(delta);
+       to_wait -= delta;
+     }
   }
 }
 
@@ -392,6 +474,37 @@ THD *Commit_stage_manager::fetch_queue_acquire_lock(StageID stage) {
 THD *Commit_stage_manager::fetch_queue_skip_acquire_lock(StageID stage) {
   DBUG_PRINT("debug", ("Fetching queue for stage %d", stage));
   return m_queue[stage].fetch_and_empty_skip_acquire_lock();
+}
+
+THD *Commit_stage_manager::fetch_numa_queue_acquire_lock(StageID stage, int numa_id) {
+  DBUG_PRINT("debug", ("Fetching queue for stage %d", stage));
+  return m_numa_queue[numa_id][stage].fetch_and_empty_acquire_lock();
+}
+
+THD *Commit_stage_manager::fetch_numa_queue_skip_acquire_lock(StageID stage, int numa_id) {
+  DBUG_PRINT("debug", ("Fetching queue for stage %d", stage));
+  return m_numa_queue[numa_id][stage].fetch_and_empty_skip_acquire_lock();
+}
+
+THD *Commit_stage_manager::fetch_sync_queue_acquire_lock(StageID stage, int numa_id, bool *skip_sync) {
+  DBUG_PRINT("debug", ("Fetching queue for stage %d", stage));
+  THD *ret = nullptr;
+  int sync_size = 0;
+  for (int j = 0; j < g_max_numa_num; j++) {
+    m_numa_queue[j][stage].lock();
+    sync_size = m_numa_queue[j][stage].get_size();
+    if(j == numa_id){
+      if( m_numa_queue[j][SYNC_STAGE].get_last_sync_queue_size() == sync_size){
+           *skip_sync = true;
+      }
+      m_numa_queue[j][SYNC_STAGE].set_last_sync_queue_size(0);
+      ret = m_numa_queue[numa_id][stage].fetch_and_empty_skip_acquire_lock();
+    }else{
+      m_numa_queue[j][SYNC_STAGE].set_last_sync_queue_size(sync_size);
+    }
+    m_numa_queue[j][stage].unlock();
+  }
+  return ret;
 }
 
 void Commit_stage_manager::process_final_stage_for_ordered_commit_group(
