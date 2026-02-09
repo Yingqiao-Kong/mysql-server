@@ -167,6 +167,9 @@ using binary_log::checksum_crc32;
 using binary_log::Log_event_header;
 using std::max;
 using std::min;
+bool g_slave_mysqld = false;
+bool g_thd_numa_bin_log_switch_initialized = false;
+
 
 #define FLAGSTR(V, F) ((V) & (F) ? #F " " : "")
 
@@ -662,7 +665,8 @@ bool start_slave(THD *thd) {
   DBUG_TRACE;
   Master_info *mi;
   bool channel_configured, error = false;
-
+  g_slave_mysqld = true;
+  g_thd_numa_bin_log_switch_initialized = false;
   if (channel_map.get_num_instances() == 1) {
     mi = channel_map.get_default_channel_mi();
     assert(mi);
@@ -8781,6 +8785,8 @@ bool start_slave(THD *thd, LEX_SLAVE_CONNECTION *connection_param,
   bool is_error = false;
   int thread_mask;
 
+  g_slave_mysqld = true;
+  g_thd_numa_bin_log_switch_initialized = false;
   DBUG_TRACE;
 
   /*

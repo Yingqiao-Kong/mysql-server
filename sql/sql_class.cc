@@ -523,6 +523,7 @@ THD::THD(bool enable_plugins)
   mysql_cond_init(key_COND_commit_done, &COND_commit_done);
   mysql_cond_init(key_COND_commit_order, &COND_commit_order);
 
+  thd_numa_id = -1;
   /* Variables with default values */
   proc_info = "login";
   where = THD::DEFAULT_WHERE;

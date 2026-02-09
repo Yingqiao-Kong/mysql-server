@@ -137,6 +137,18 @@ using std::max;
 using std::min;
 using std::string;
 
+uint available_cpus_num = 0;
+uint total_threads_num = 0;
+int g_min_numa_node_id = -1;
+int available_cpus[CPU_SETSIZE] = {-1};
+typedef struct {
+  int node_id;
+  int *cpus;
+  int cpu_count;
+} numa_node_info_t;
+
+numa_node_info_t *g_numa_nodes = NULL;
+
 #define FLAGSTR(V, F) ((V) & (F) ? #F " " : "")
 #define YESNO(X) ((X) ? "yes" : "no")
 
@@ -3460,6 +3472,101 @@ bool mysql_show_binlog_events(THD *thd) {
 
   return show_binlog_events(thd, &mysql_bin_log);
 }
+#ifdef HAVE_LIBNUMA
+bool binlog_get_available_cpu(){
+  if (g_numa_nodes) return g_binlog_numa_initialized;
+
+  cpu_set_t g_thread_original_set;
+  CPU_ZERO(&g_thread_original_set);
+  if (pthread_getaffinity_np(pthread_self(), sizeof(g_thread_original_set), &g_thread_original_set) != 0) {
+    return false;
+  }
+  int num_cpus = sysconf(_SC_NPROCESSORS_CONF);
+  int count = 0;
+  for (int i = 0; i < num_cpus; i++) {
+    if (CPU_ISSET(i, &g_thread_original_set)) {
+      available_cpus[count] = i;
+      count++;
+    }
+  }
+  if(count != 0){
+    available_cpus_num = count;
+  }
+  int max_nodes = numa_max_node() + 1;
+  if (max_nodes <= 0) {
+    return false;
+  }else{
+    g_max_numa_num = max_nodes;
+  }
+  g_numa_nodes = (numa_node_info_t *)calloc(max_nodes, sizeof(numa_node_info_t));
+  if (!g_numa_nodes) {
+    return false;
+  }
+  int numa_node_count = 0;
+  bool g_numa_nodes_initialized = true;
+  for (int node = 0; node < max_nodes; node++) {
+    struct bitmask *node_cpus = numa_allocate_cpumask();
+    if (!node_cpus) {
+      g_numa_nodes_initialized = false;
+      break;
+    }
+    if (numa_node_to_cpus(node, node_cpus) != 0) {
+      numa_free_cpumask(node_cpus);
+      g_numa_nodes_initialized = false;
+      break;
+    }
+
+    int available_cpu_count = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+      if (numa_bitmask_isbitset(node_cpus, cpu) &&
+        CPU_ISSET(cpu, &g_thread_original_set)) {
+        available_cpu_count++;
+      }
+    }
+    if (available_cpu_count > 0) {
+      if(g_min_numa_node_id == -1){
+        g_min_numa_node_id = node;
+      }
+      g_numa_nodes[node].node_id = node;
+      g_numa_nodes[node].cpu_count = available_cpu_count;
+      g_numa_nodes[node].cpus = (int *)calloc(available_cpu_count, sizeof(int));
+      if (!g_numa_nodes[node].cpus) {
+        numa_free_cpumask(node_cpus);
+        g_numa_nodes[node].node_id = -1;
+        g_numa_nodes_initialized = false;
+        break;
+      }
+      int index = 0;
+      for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (numa_bitmask_isbitset(node_cpus, cpu) &&
+          CPU_ISSET(cpu, &g_thread_original_set)) {
+          g_numa_nodes[node].cpus[index++] = cpu;
+        }
+      }
+      numa_node_count++;
+    }else{
+      g_numa_nodes[node].node_id = -1;
+      g_numa_nodes[node].cpus = NULL;
+    }
+    numa_free_cpumask(node_cpus);
+  }
+  if(!g_numa_nodes_initialized){
+    for (int i = 0; i < max_nodes; i++) {
+      if (g_numa_nodes[i].cpus) {
+        free(g_numa_nodes[i].cpus);
+        g_numa_nodes[i].cpus = nullptr;
+      }
+      g_numa_nodes[i].node_id = -1;
+      g_numa_nodes[i].cpu_count = 0;
+    }
+    free(g_numa_nodes);
+    g_numa_nodes = nullptr;
+    return false;
+  }
+  g_binlog_numa_initialized = true;
+  return g_binlog_numa_initialized;
+}
+#endif
 
 MYSQL_BIN_LOG::MYSQL_BIN_LOG(uint *sync_period, bool relay_log)
     : name(nullptr),
@@ -3495,6 +3602,7 @@ void MYSQL_BIN_LOG::cleanup() {
     inited = false;
     close(LOG_CLOSE_INDEX | LOG_CLOSE_STOP_EVENT, true /*need_lock_log=true*/,
           true /*need_lock_index=true*/);
+    mysql_mutex_destroy(&LOCK_thread_num);
     mysql_mutex_destroy(&LOCK_log);
     mysql_mutex_destroy(&LOCK_index);
     mysql_mutex_destroy(&LOCK_commit);
@@ -3519,12 +3627,32 @@ void MYSQL_BIN_LOG::cleanup() {
 
   delete m_binlog_file;
   m_binlog_file = nullptr;
+
+#ifdef HAVE_LIBNUMA
+  if (g_numa_nodes) {
+    int max_nodes = g_max_numa_num > 0 ? g_max_numa_num : numa_max_node() + 1;
+    for (int i = 0; i < max_nodes; i++) {
+      if (g_numa_nodes[i].cpus) {
+        free(g_numa_nodes[i].cpus);
+        g_numa_nodes[i].cpus = nullptr;
+      }
+      g_numa_nodes[i].node_id = -1;
+      g_numa_nodes[i].cpu_count = 0;
+    }
+    free(g_numa_nodes);
+    g_numa_nodes = nullptr;
+  }
+  g_binlog_numa_initialized = false;
+  g_thd_numa_bin_log_switch_initialized = false;
+  thd_numa_bin_log_switch = false;
+#endif
 }
 
 void MYSQL_BIN_LOG::init_pthread_objects() {
   assert(inited == 0);
   inited = true;
 
+  mysql_mutex_init(m_key_LOCK_log, &LOCK_thread_num, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(m_key_LOCK_log, &LOCK_log, MY_MUTEX_INIT_SLOW);
   mysql_mutex_init(m_key_LOCK_index, &LOCK_index, MY_MUTEX_INIT_SLOW);
   mysql_mutex_init(m_key_LOCK_commit, &LOCK_commit, MY_MUTEX_INIT_FAST);
@@ -3534,6 +3662,9 @@ void MYSQL_BIN_LOG::init_pthread_objects() {
   mysql_mutex_init(m_key_LOCK_xids, &LOCK_xids, MY_MUTEX_INIT_FAST);
   mysql_cond_init(m_key_update_cond, &update_cond);
   mysql_cond_init(m_key_prep_xids_cond, &m_prep_xids_cond);
+#ifdef HAVE_LIBNUMA
+  binlog_get_available_cpu();
+#endif
   if (!is_relay_log) {
     Commit_stage_manager::get_instance().init(
         m_key_LOCK_flush_queue, m_key_LOCK_sync_queue, m_key_LOCK_commit_queue,
@@ -4943,6 +5074,15 @@ bool MYSQL_BIN_LOG::open_binlog(
   if (init_and_set_log_file_name(log_name, new_name, new_index_number)) {
     LogErr(ERROR_LEVEL, ER_BINLOG_CANT_GENERATE_NEW_FILE_NAME);
     return true;
+  }
+
+  if(!g_thd_numa_bin_log_switch_initialized){
+    g_thd_numa_bin_log_switch_initialized = true;
+    if(opt_numa_bin_log && g_binlog_numa_initialized && !g_slave_mysqld && opt_binlog_order_commits){
+      thd_numa_bin_log_switch = true;
+    }else{
+      thd_numa_bin_log_switch = false;
+    }
   }
 
   DBUG_PRINT("info", ("generated filename: %s", log_file_name));
@@ -8436,20 +8576,38 @@ THD *MYSQL_BIN_LOG::fetch_and_process_flush_stage_queue(
     for guaranteeing to flush prepared records of transactions before
     flushing them to binary log, which is required by crash recovery.
   */
-  Commit_stage_manager::get_instance().lock_queue(
-      Commit_stage_manager::BINLOG_FLUSH_STAGE);
+  THD *first_seen;
+  THD *commit_order_thd;
+  if(thd_numa_bin_log_switch){
+      int numa_id = thread_numa_id;
+      Commit_stage_manager::get_instance().lock_numa_queue(
+          Commit_stage_manager::BINLOG_FLUSH_STAGE, numa_id);
+      first_seen =
+          Commit_stage_manager::get_instance().fetch_numa_queue_skip_acquire_lock(
+              Commit_stage_manager::BINLOG_FLUSH_STAGE, numa_id);
+      assert(first_seen != nullptr);
+      commit_order_thd =
+          Commit_stage_manager::get_instance().fetch_numa_queue_skip_acquire_lock(
+              Commit_stage_manager::COMMIT_ORDER_FLUSH_STAGE, numa_id);
 
-  THD *first_seen =
-      Commit_stage_manager::get_instance().fetch_queue_skip_acquire_lock(
+      Commit_stage_manager::get_instance().unlock_numa_queue(
+          Commit_stage_manager::BINLOG_FLUSH_STAGE, numa_id);
+  }else{
+      Commit_stage_manager::get_instance().lock_queue(
           Commit_stage_manager::BINLOG_FLUSH_STAGE);
-  assert(first_seen != nullptr);
 
-  THD *commit_order_thd =
-      Commit_stage_manager::get_instance().fetch_queue_skip_acquire_lock(
-          Commit_stage_manager::COMMIT_ORDER_FLUSH_STAGE);
+      first_seen =
+          Commit_stage_manager::get_instance().fetch_queue_skip_acquire_lock(
+              Commit_stage_manager::BINLOG_FLUSH_STAGE);
+      assert(first_seen != nullptr);
 
-  Commit_stage_manager::get_instance().unlock_queue(
-      Commit_stage_manager::BINLOG_FLUSH_STAGE);
+      commit_order_thd =
+          Commit_stage_manager::get_instance().fetch_queue_skip_acquire_lock(
+              Commit_stage_manager::COMMIT_ORDER_FLUSH_STAGE);
+
+      Commit_stage_manager::get_instance().unlock_queue(
+          Commit_stage_manager::BINLOG_FLUSH_STAGE);
+  }
 
   if (check_if_flush_binlog_in_advance() && !check_and_skip_flush_logs) {
     ordered_commit_flush_thread *flush_mngr = &(binlog_flush_thread_mngr);
@@ -8945,7 +9103,37 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   int flush_error = 0, sync_error = 0;
   my_off_t total_bytes = 0;
   bool do_rotate = false;
+  int numa_id = 0;
+  bool skip_sync = false;
 
+#ifdef HAVE_LIBNUMA
+  if(thd_numa_bin_log_switch){
+    if(thd->thd_numa_id == -1){
+      pthread_t thread_id = pthread_self();
+      int index = 0;
+      mysql_mutex_lock(&LOCK_thread_num);
+      index = total_threads_num%available_cpus_num;
+      total_threads_num++;
+      mysql_mutex_unlock(&LOCK_thread_num);
+      int cpu_id = available_cpus[index];
+      numa_id = numa_node_of_cpu(cpu_id);
+      if(numa_id < 0 || numa_id >= g_max_numa_num){
+        numa_id = g_min_numa_node_id;
+      }
+      numa_node_info_t *node_info = &g_numa_nodes[numa_id];
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      for (int i = 0; i < node_info->cpu_count; i++) {
+          CPU_SET(node_info->cpus[i], &cpuset);
+      }
+      pthread_setaffinity_np(thread_id, sizeof(cpu_set_t), &cpuset);
+      thd->thd_numa_id = numa_id;
+      thread_numa_id = numa_id;
+    }else{
+      numa_id = thd->thd_numa_id;
+    }
+  }
+#endif
   DBUG_EXECUTE_IF("crash_commit_before_log", DBUG_SUICIDE(););
   init_thd_variables(thd, all, skip_commit);
   DBUG_PRINT("enter", ("commit_pending: %s, commit_error: %d, thread_id: %u",
@@ -9068,8 +9256,22 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
         opt_binlog_group_commit_sync_no_delay_count,
         opt_binlog_group_commit_sync_delay, Commit_stage_manager::SYNC_STAGE);
 
-  final_queue = Commit_stage_manager::get_instance().fetch_queue_acquire_lock(
-      Commit_stage_manager::SYNC_STAGE);
+  if(thd_numa_bin_log_switch){
+    if(!opt_numa_bin_log_skip_sync){
+      final_queue = Commit_stage_manager::get_instance().fetch_numa_queue_acquire_lock(
+          Commit_stage_manager::SYNC_STAGE, numa_id);
+    }else{
+        skip_sync = false;
+        final_queue = Commit_stage_manager::get_instance().fetch_sync_queue_acquire_lock(
+                                        Commit_stage_manager::SYNC_STAGE, numa_id, &skip_sync);
+        if(skip_sync){
+          goto update_binlog_end_pos_after_sync_label;
+        }
+    }
+  }else{
+    final_queue = Commit_stage_manager::get_instance().fetch_queue_acquire_lock(
+        Commit_stage_manager::SYNC_STAGE);
+  }
 
   if (flush_error == 0 && total_bytes > 0) {
     DEBUG_SYNC(thd, "before_sync_binlog_file");
@@ -9077,6 +9279,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     sync_error = result.first;
   }
 
+update_binlog_end_pos_after_sync_label:
   if (update_binlog_end_pos_after_sync) {
     THD *tmp_thd = final_queue;
     const char *binlog_file = nullptr;
@@ -9119,9 +9322,16 @@ commit_stage:
                             thd->commit_error));
       return finish_commit(thd);
     }
-    THD *commit_queue =
-        Commit_stage_manager::get_instance().fetch_queue_acquire_lock(
-            Commit_stage_manager::COMMIT_STAGE);
+    THD *commit_queue;
+    if(thd_numa_bin_log_switch){
+      commit_queue =
+      Commit_stage_manager::get_instance().fetch_numa_queue_acquire_lock(
+          Commit_stage_manager::COMMIT_STAGE, numa_id);
+    }else{
+      commit_queue =
+          Commit_stage_manager::get_instance().fetch_queue_acquire_lock(
+              Commit_stage_manager::COMMIT_STAGE);
+    }
     DBUG_EXECUTE_IF("semi_sync_3-way_deadlock",
                     DEBUG_SYNC(thd, "before_process_commit_stage_queue"););
 

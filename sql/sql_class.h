@@ -2333,6 +2333,8 @@ class THD : public MDL_context_owner,
     group commit.
   */
   THD *next_to_commit;
+  
+  int thd_numa_id;
 
   /**
     The member is served for marking a query that CREATEs or ALTERs

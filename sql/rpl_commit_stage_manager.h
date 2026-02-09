@@ -25,12 +25,20 @@
 
 #include <atomic>
 #include <utility>
+#ifdef HAVE_LIBNUMA
+#include <numa.h>
+#endif /* HAVE_LIBNUMA */
 
 #include "my_dbug.h"
 #include "mysql/psi/mysql_cond.h"
 #include "mysql/psi/mysql_mutex.h"
 #include "sql/sql_class.h"
 #include "thr_mutex.h"
+
+extern int g_max_numa_num;
+extern bool g_binlog_numa_initialized;
+extern thread_local int thread_numa_id;
+extern thread_local bool thd_numa_bin_log_switch;
 
 class THD;
 
@@ -43,7 +51,7 @@ class Commit_stage_manager {
     friend class Commit_stage_manager;
 
    public:
-    Mutex_queue() : m_first(nullptr), m_last(&m_first), m_size(0) {}
+    Mutex_queue() : m_first(nullptr), m_last(&m_first), m_size(0), m_last_sync_queue_size(0) {}
 
     void init(mysql_mutex_t *lock) { m_lock = lock; }
 
@@ -92,7 +100,11 @@ class Commit_stage_manager {
 
       @retval  Returns number of element in the queue.
     */
-    inline int32 get_size() { return m_size.load(); }
+    inline int32 get_size() { return m_size.load(std::memory_order_acquire); }
+
+    inline int32 get_last_sync_queue_size() { return m_last_sync_queue_size; }
+    inline void set_last_sync_queue_size(int32 sync_queue_size) { m_last_sync_queue_size = sync_queue_size; }
+
 
     /**
       Fetch the first thread of the queue.
@@ -134,6 +146,8 @@ class Commit_stage_manager {
 
     /** size of the queue */
     std::atomic<int32> m_size;
+
+    int32 m_last_sync_queue_size;
 
     /** Lock for protecting the queue. */
     mysql_mutex_t *m_lock;
@@ -252,6 +266,10 @@ class Commit_stage_manager {
     return m_queue[stage].pop_front();
   }
 
+  std::pair<bool, THD *> pop_numa_front(StageID stage, int numa_id) {
+    return m_numa_queue[numa_id][stage].pop_front();
+  }
+
 #ifndef NDEBUG
   /**
      The method ensures the follower's execution path can be preempted
@@ -273,6 +291,8 @@ class Commit_stage_manager {
     @return Pointer to the first session of the queue.
   */
   THD *fetch_queue_acquire_lock(StageID stage);
+  THD *fetch_numa_queue_acquire_lock(StageID stage, int numa_id);
+  THD *fetch_sync_queue_acquire_lock(StageID stage, int numa_id, bool *skip_sync);
 
   /**
     Fetch the entire queue and empty it. The caller must acquire queue lock
@@ -283,6 +303,7 @@ class Commit_stage_manager {
     @return Pointer to the first session of the queue.
   */
   THD *fetch_queue_skip_acquire_lock(StageID stage);
+  THD *fetch_numa_queue_skip_acquire_lock(StageID stage, int numa_id);
 
   /**
     Introduces a wait operation on the executing thread.  The
@@ -323,6 +344,7 @@ class Commit_stage_manager {
     @param[in]  stage  Stage identifier for the queue to append to.
   */
   void lock_queue(StageID stage) { m_queue[stage].lock(); }
+  void lock_numa_queue(StageID stage, int numa_id) { m_numa_queue[numa_id][stage].lock(); }
 
   /**
     Wrapper on Mutex_queue unlock(), releases lock on stage queue.
@@ -330,6 +352,7 @@ class Commit_stage_manager {
     @param[in]  stage  Stage identifier for the queue to append to.
   */
   void unlock_queue(StageID stage) { m_queue[stage].unlock(); }
+  void unlock_numa_queue(StageID stage, int numa_id) { m_numa_queue[numa_id][stage].unlock(); }
 
  private:
   /** check if Commit_stage_manager variables already initalized. */
@@ -350,6 +373,7 @@ class Commit_stage_manager {
                      (when binlog_order_commit=1).
   */
   Mutex_queue m_queue[STAGE_COUNTER];
+  Mutex_queue (*m_numa_queue)[STAGE_COUNTER];
 
   /**
      The binlog leader waits on this condition variable till it is indicated
@@ -377,6 +401,7 @@ class Commit_stage_manager {
 
   /** Mutex used for the stage level locks */
   mysql_mutex_t m_queue_lock[STAGE_COUNTER - 1];
+  mysql_mutex_t (*m_numa_queue_lock)[STAGE_COUNTER - 1];
 
 #ifndef NDEBUG
   /** Save pointer to leader thread which is used later to awake leader */

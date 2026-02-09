@@ -44,6 +44,10 @@ mandatory_roles
 mandatory_roles
 max_length_for_sort_data
 max_length_for_sort_data
+numa_bin_log
+numa_bin_log
+numa_bin_log_skip_sync
+numa_bin_log_skip_sync
 ordered_commit_flush_binlog_in_advance
 ordered_commit_flush_binlog_in_advance
 partial_revokes

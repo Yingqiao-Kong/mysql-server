@@ -150,6 +150,10 @@ enum_server_operational_state get_server_state();
 
 extern bool opt_large_files, server_id_supplied;
 extern bool opt_bin_log;
+/*bin log numa variables begin*/
+extern bool opt_numa_bin_log;
+extern bool opt_numa_bin_log_skip_sync;
+/*bin log numa variables end*/
 extern bool opt_log_slave_updates;
 extern bool opt_log_unsafe_statements;
 extern bool opt_general_log, opt_slow_log, opt_general_log_raw;
