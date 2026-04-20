@@ -7089,3 +7089,8 @@ static Sys_var_bool Sys_skip_slave_start(
     READ_ONLY GLOBAL_VAR(opt_skip_slave_start), CMD_LINE(OPT_ARG),
     DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
     ON_UPDATE(nullptr));
+
+static Sys_var_bool Sys_ordered_commit_flush_binlog_in_advance(
+    "ordered_commit_flush_binlog_in_advance", "Flush binlog by a dedicated thread during flush stage "
+    "while flushing logs of storage engines.",
+    READ_ONLY GLOBAL_VAR(opt_oc_flush_binlog_in_advance), CMD_LINE(OPT_ARG), DEFAULT(true));
