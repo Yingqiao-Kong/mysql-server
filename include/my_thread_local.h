@@ -63,6 +63,9 @@ my_thread_id my_thread_var_id();
 
 void set_my_thread_var_id(my_thread_id id);
 
+CODE_STATE *code_state(void);
+void *get_cs_stack(CODE_STATE *cs);
+void set_cs_stack(CODE_STATE *cs_mod, void *stack);
 #endif
 
 #endif  // MY_THREAD_LOCAL_INCLUDED

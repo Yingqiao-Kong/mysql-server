@@ -44,6 +44,8 @@ mandatory_roles
 mandatory_roles
 max_length_for_sort_data
 max_length_for_sort_data
+ordered_commit_flush_binlog_in_advance
+ordered_commit_flush_binlog_in_advance
 partial_revokes
 partial_revokes
 password_require_current
