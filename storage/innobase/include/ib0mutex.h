@@ -390,8 +390,8 @@ struct TTASEventMutex {
   /** Try and lock the mutex. Note: POSIX returns 0 on success.
   @return true on success */
   bool try_lock() UNIV_NOTHROW {
-    bool ret = m_lock_word.exchange(true, std::memory_order_seq_cst);
-    return ret == false;
+    bool expected = false;
+    return (m_lock_word.compare_exchange_strong(expected, true));
   }
 
   /** Release the mutex. */
