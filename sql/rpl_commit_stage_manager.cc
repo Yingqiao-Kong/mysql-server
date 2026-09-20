@@ -20,6 +20,7 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
+#include "my_hygon.h"
 #include <algorithm>
 
 #include "sql/binlog.h"
@@ -200,9 +201,17 @@ void Commit_stage_manager::deinit() {
   mysql_mutex_destroy(&m_lock_done);
 }
 
-bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
-                                      mysql_mutex_t *stage_mutex,
-                                      mysql_mutex_t *enter_mutex) {
+template <bool UseThreadMutex>
+bool Commit_stage_manager::enroll_for_impl(
+    StageID stage, THD *thd,
+    mysql_mutex_t *stage_mutex, mysql_mutex_t *enter_mutex) {
+  mysql_mutex_t *done_mutex =
+      UseThreadMutex ? &thd->LOCK_commit_done : &m_lock_done;
+  mysql_cond_t *order_cond =
+      UseThreadMutex ? &thd->COND_commit_order : &m_stage_cond_commit_order;
+  mysql_cond_t *done_cond =
+      UseThreadMutex ? &thd->COND_commit_done : &m_stage_cond_binlog;
+
   DBUG_TRACE;
 
   // If the queue was empty: we're the leader for this batch
@@ -325,27 +334,28 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
   */
   if (!leader) {
     CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_follower_wait");
+    if (!UseThreadMutex) mysql_mutex_lock(&m_lock_done);
 #ifndef NDEBUG
     /*
       Leader can be awaiting all-clear to preempt follower's execution.
       With setting the status the follower ensures it won't execute anything
       including thread-specific code.
     */
-    mysql_mutex_lock(&m_lock_done);
+    if (UseThreadMutex) mysql_mutex_lock(&m_lock_done);
     thd->get_transaction()->m_flags.ready_preempt = 1;
     if (leader_await_preempt_status) mysql_cond_signal(&m_cond_preempt);
-    mysql_mutex_unlock(&m_lock_done);
+    if (UseThreadMutex) mysql_mutex_unlock(&m_lock_done);
 #endif
 
-    mysql_mutex_lock(&thd->LOCK_commit_done);
+    if (UseThreadMutex) mysql_mutex_lock(&thd->LOCK_commit_done);
     while (thd->tx_commit_pending) {
       if (stage == COMMIT_ORDER_FLUSH_STAGE) {
-        mysql_cond_wait(&thd->COND_commit_order, &thd->LOCK_commit_done);
+        mysql_cond_wait(order_cond, done_mutex);
       } else {
-        mysql_cond_wait(&thd->COND_commit_done, &thd->LOCK_commit_done);
+        mysql_cond_wait(done_cond, done_mutex);
       }
     }
-    mysql_mutex_unlock(&thd->LOCK_commit_done);
+    mysql_mutex_unlock(done_mutex);
 
     return false;
   }
@@ -384,13 +394,13 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
       mysql_cond_signal(&m_stage_cond_leader);
       unlock_queue(stage);
 
-      mysql_mutex_lock(&thd->LOCK_commit_done);
+      mysql_mutex_lock(done_mutex);
       /* wait for signal from binlog leader */
       CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP(
           "before_commit_order_leader_waits_for_binlog_leader");
       while (thd->tx_commit_pending)
-        mysql_cond_wait(&thd->COND_commit_order, &thd->LOCK_commit_done);
-      mysql_mutex_unlock(&thd->LOCK_commit_done);
+        mysql_cond_wait(order_cond, done_mutex);
+      mysql_mutex_unlock(done_mutex);
 
       leader = false;
       return leader;
@@ -398,6 +408,15 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
   }
 
   return leader;
+}
+
+bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
+                                      mysql_mutex_t *stage_mutex,
+                                      mysql_mutex_t *enter_mutex) {
+  if (my_cpu_is_hygon()) {
+    return enroll_for_impl<true>(stage, thd, stage_mutex, enter_mutex);
+  }
+  return enroll_for_impl<false>(stage, thd, stage_mutex, enter_mutex);
 }
 
 THD *Commit_stage_manager::Mutex_queue::fetch_and_empty_acquire_lock() {
@@ -515,28 +534,53 @@ void Commit_stage_manager::process_final_stage_for_ordered_commit_group(
   }
 }
 
-void Commit_stage_manager::signal_done(THD *queue, StageID stage) {
-  THD *cur = queue;
-  THD *next = nullptr;
+template <bool UseThreadMutex>
+void Commit_stage_manager::signal_done_impl(THD *queue, StageID stage) {
+  if (!UseThreadMutex) {
+    mysql_mutex_lock(&m_lock_done);
 
-  while (cur) {
-    /*
-      Fetch next pointer before wake cur, since cur may quit or be reused before we fetch its next_to_commit.
-    */
-    next = cur->next_to_commit;
+    for (THD *thd = queue; thd; thd = thd->next_to_commit) {
+      thd->tx_commit_pending = false;
+    }
 
-    mysql_mutex_lock(&cur->LOCK_commit_done);
-    cur->tx_commit_pending = false;
-
+    /* if thread belong to commit order wake only commit order queue threads */
     if (stage == COMMIT_ORDER_FLUSH_STAGE)
-      mysql_cond_signal(&cur->COND_commit_order);
+      mysql_cond_broadcast(&m_stage_cond_commit_order);
     else
-      mysql_cond_signal(&cur->COND_commit_done);
+      mysql_cond_broadcast(&m_stage_cond_binlog);
 
-    mysql_mutex_unlock(&cur->LOCK_commit_done);
+    mysql_mutex_unlock(&m_lock_done);
+  } else {
+    THD *cur = queue;
+    THD *next = nullptr;
 
-    cur = next;
+    while (cur) {
+      /*
+        Fetch next pointer before wake cur, since cur may quit or be reused
+        before we fetch its next_to_commit.
+      */
+      next = cur->next_to_commit;
+
+      mysql_mutex_lock(&cur->LOCK_commit_done);
+      cur->tx_commit_pending = false;
+
+      if (stage == COMMIT_ORDER_FLUSH_STAGE)
+        mysql_cond_signal(&cur->COND_commit_order);
+      else
+        mysql_cond_signal(&cur->COND_commit_done);
+
+      mysql_mutex_unlock(&cur->LOCK_commit_done);
+
+      cur = next;
+    }
   }
+}
+
+void Commit_stage_manager::signal_done(THD *queue, StageID stage) {
+  if (my_cpu_is_hygon()) {
+    return signal_done_impl<true>(queue, stage);
+  }
+  return signal_done_impl<false>(queue, stage);
 }
 
 #ifndef NDEBUG

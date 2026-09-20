@@ -22,6 +22,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
+#include "my_hygon.h"
 #include "sql/sql_class.h"
 
 #include <assert.h>
@@ -519,9 +520,12 @@ THD::THD(bool enable_plugins)
                    MY_MUTEX_INIT_FAST);
   mysql_cond_init(key_COND_thr_lock, &COND_thr_lock);
 
-  mysql_mutex_init(key_LOCK_commit_done, &LOCK_commit_done, MY_MUTEX_INIT_FAST);
-  mysql_cond_init(key_COND_commit_done, &COND_commit_done);
-  mysql_cond_init(key_COND_commit_order, &COND_commit_order);
+  if (my_cpu_is_hygon()) {
+    mysql_mutex_init(key_LOCK_commit_done, &LOCK_commit_done,
+                     MY_MUTEX_INIT_FAST);
+    mysql_cond_init(key_COND_commit_done, &COND_commit_done);
+    mysql_cond_init(key_COND_commit_order, &COND_commit_order);
+  }
 
   thd_numa_id = -1;
   /* Variables with default values */
@@ -1119,9 +1123,11 @@ THD::~THD() {
   mysql_mutex_destroy(&LOCK_thd_protocol);
   mysql_mutex_destroy(&LOCK_current_cond);
   mysql_cond_destroy(&COND_thr_lock);
-  mysql_mutex_destroy(&LOCK_commit_done);
-  mysql_cond_destroy(&COND_commit_done);
-  mysql_cond_destroy(&COND_commit_order);
+  if (my_cpu_is_hygon()) {
+    mysql_mutex_destroy(&LOCK_commit_done);
+    mysql_cond_destroy(&COND_commit_done);
+    mysql_cond_destroy(&COND_commit_order);
+  }
 #ifndef NDEBUG
   dbug_sentry = THD_SENTRY_GONE;
 #endif

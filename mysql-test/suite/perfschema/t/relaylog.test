@@ -26,6 +26,8 @@ drop table test.t1;
 # - statistics are normalized to "NONE" or "MANY"
 # - statistics on ::update_cond conditions are not collected,
 #   since this is too much dependent on execution.
+# - statistics on MYSQL_BIN_LOG::LOCK_done are not collected because its
+#   use depends on the CPU vendor policy and the debug preemption handshake.
 #
 
 connection master;
@@ -71,6 +73,7 @@ select
   from performance_schema.events_waits_summary_global_by_event_name
   where event_name like "%MYSQL_BIN_LOG%"
   and event_name not like "%MYSQL_BIN_LOG::update_cond"
+  and event_name not like "%MYSQL_BIN_LOG::LOCK_done"
   order by event_name;
 
 -- echo "Expect no slave relay log"
@@ -139,6 +142,7 @@ select
   from performance_schema.events_waits_summary_global_by_event_name
   where event_name like "%MYSQL_BIN_LOG%"
   and event_name not like "%MYSQL_BIN_LOG::update_cond"
+  and event_name not like "%MYSQL_BIN_LOG::LOCK_done"
   order by event_name;
 
 -- echo "Expect a slave relay log"
