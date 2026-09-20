@@ -22,6 +22,16 @@
 
 ADD_WSHADOW_WARNING()
 
+# Shared by mysys and bundled zlib; compile the CPU policy only once.
+# Keep the internal detector out of consumers' dynamic symbol tables.
+SET(MY_HYGON_COMPILE_OPTIONS)
+IF(HAVE_VISIBILITY_HIDDEN)
+  LIST(APPEND MY_HYGON_COMPILE_OPTIONS "-fvisibility=hidden")
+ENDIF()
+ADD_CONVENIENCE_LIBRARY(my_hygon my_hygon.cc
+  COMPILE_OPTIONS ${MY_HYGON_COMPILE_OPTIONS})
+UNSET(MY_HYGON_COMPILE_OPTIONS)
+
 SET(MY_TIME_SOURCES my_time.cc my_systime.cc)
 
 ADD_CONVENIENCE_LIBRARY(mytime ${MY_TIME_SOURCES})
@@ -165,6 +175,7 @@ ENDIF()
 
 ADD_CONVENIENCE_LIBRARY(mysys ${MYSYS_SOURCES}
   LINK_LIBRARIES
+  my_hygon
   mytime
   strings
   ${ZLIB_LIBRARY}
