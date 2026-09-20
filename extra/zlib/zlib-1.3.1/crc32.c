@@ -27,6 +27,7 @@
 #  endif /* !DYNAMIC_CRC_TABLE */
 #endif /* MAKECRCH */
 
+#include "my_hygon.h"
 #include "zutil.h"      /* for Z_U4, Z_U8, z_crc_t, and FAR definitions */
 
 #if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64)
@@ -564,6 +565,7 @@ local once_t crc32_x86_once = ONCE_INIT;
 
 static void crc32_x86_init(void) {
     crc32_x86_fp = NULL;
+    if (!my_cpu_is_hygon()) return;
 #ifdef HAVE_VPCLMULQDQ_ATTRIBUTE
     if (has_crc32_x86_avx512())
         crc32_x86_fp = crc32_z_impl_x86_avx512;
