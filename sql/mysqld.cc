@@ -677,6 +677,7 @@ MySQL clients support the protocol:
 #include "sql/mysqld.h"
 
 #include "my_config.h"
+#include "my_hygon.h"
 
 #include "errmsg.h"  // init_client_errs
 #include "ft_global.h"
@@ -10314,6 +10315,15 @@ static int get_options(int *argc_ptr, char ***argv_ptr) {
     between options, setting of multiple variables, etc.
     Do them here.
   */
+
+  /* Normalize the read-only option before any binlog worker is started. */
+  if (!my_cpu_is_hygon()) {
+    if (opt_oc_flush_binlog_in_advance) {
+      LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+             "Failed to enable parallel flush on current CPU.");
+    }
+    opt_oc_flush_binlog_in_advance = false;
+  }
 
   if (!opt_help && opt_verbose) LogErr(ERROR_LEVEL, ER_VERBOSE_REQUIRES_HELP);
 
