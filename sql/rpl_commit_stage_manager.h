@@ -355,6 +355,14 @@ class Commit_stage_manager {
   void unlock_numa_queue(StageID stage, int numa_id) { m_numa_queue[numa_id][stage].unlock(); }
 
  private:
+  /** Implement the locking policy selected by the public entry points. */
+  template <bool UseThreadMutex>
+  bool enroll_for_impl(StageID stage, THD *thd, mysql_mutex_t *stage_mutex,
+                       mysql_mutex_t *enter_mutex);
+
+  template <bool UseThreadMutex>
+  void signal_done_impl(THD *queue, StageID stage);
+
   /** check if Commit_stage_manager variables already initalized. */
   bool m_is_initialized;
 
