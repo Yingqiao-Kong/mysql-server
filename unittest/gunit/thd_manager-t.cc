@@ -84,12 +84,14 @@ TEST_F(ThreadManagerTest, AddRemoveTHDWithGuard) {
 
 TEST_F(ThreadManagerTest, IncDecThreadRunning) {
   THD thd1(false);
+  thd1.set_new_thread_id();
   thd_manager->add_thd(&thd1);
   EXPECT_EQ(0, thd_manager->get_num_thread_running());
   thd_manager->inc_thread_running(&thd1);
   EXPECT_EQ(1, thd_manager->get_num_thread_running());
   thd_manager->dec_thread_running(&thd1);
   EXPECT_EQ(0, thd_manager->get_num_thread_running());
+  thd_manager->remove_thd(&thd1);
 }
 
 TEST_F(ThreadManagerTest, IncThreadCreated) {

@@ -156,12 +156,12 @@ class Global_THD_manager {
   /**
     Increments thread running statistic variable.
   */
-  void inc_thread_running(THD *thd) const;
+  void inc_thread_running(THD *thd);
 
   /**
     Decrements thread running statistic variable.
   */
-  void dec_thread_running(THD *thd) const;
+  void dec_thread_running(THD *thd);
 
   /**
     Retrieves thread created statistic variable.

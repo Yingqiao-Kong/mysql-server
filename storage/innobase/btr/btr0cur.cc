@@ -49,6 +49,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
  Created 10/16/1994 Heikki Tuuri
  *******************************************************/
 
+#include "my_hygon.h"
 #include "btr0cur.h"
 
 #include <assert.h>
@@ -767,7 +768,7 @@ void btr_cur_search_to_nth_level(
 #endif
   /* Use of AHI is disabled for intrinsic table as these tables re-use
   the index-id and AHI validation is based on index-id. */
-  if (btr_search_enabled) {
+  if (!my_cpu_is_hygon() || btr_search_enabled) {
     if (rw_lock_get_writer(btr_get_search_latch(index)) == RW_LOCK_NOT_LOCKED &&
       latch_mode <= BTR_MODIFY_LEAF && info->last_hash_succ &&
       !index->disable_ahi && !estimate
