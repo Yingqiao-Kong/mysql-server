@@ -37,6 +37,7 @@
   (for example in storage/myisam/ha_myisam.cc) !
 */
 
+#include "my_hygon.h"
 #include "sql/sys_vars.h"
 
 #include "my_config.h"
@@ -7109,4 +7110,5 @@ static Sys_var_bool Sys_skip_slave_start(
 static Sys_var_bool Sys_ordered_commit_flush_binlog_in_advance(
     "ordered_commit_flush_binlog_in_advance", "Flush binlog by a dedicated thread during flush stage "
     "while flushing logs of storage engines.",
-    READ_ONLY GLOBAL_VAR(opt_oc_flush_binlog_in_advance), CMD_LINE(OPT_ARG), DEFAULT(true));
+    READ_ONLY GLOBAL_VAR(opt_oc_flush_binlog_in_advance), CMD_LINE(OPT_ARG),
+    DEFAULT(my_cpu_is_hygon()));
