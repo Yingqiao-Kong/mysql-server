@@ -20,6 +20,7 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
+#include "my_hygon.h"
 #include "sql/mysqld_thd_manager.h"
 
 #include "my_config.h"
@@ -234,6 +235,7 @@ my_thread_id Global_THD_manager::get_new_thread_id() {
 }
 
 int Global_THD_manager::get_num_thread_running() {
+  if (!my_cpu_is_hygon()) return atomic_num_thread_running;
   int num = 0;
   for (int i = 0; i < NUM_PARTITIONS; i++) {
     mysql_mutex_lock(&LOCK_thd_list[i]);
@@ -247,12 +249,20 @@ int Global_THD_manager::get_num_thread_running() {
   return num;
 }
 
-void Global_THD_manager::inc_thread_running(THD *thd) const {
-  thd->set_is_running(true);
+void Global_THD_manager::inc_thread_running(THD *thd) {
+  if (my_cpu_is_hygon()) {
+    thd->set_is_running(true);
+  } else {
+    atomic_num_thread_running++;
+  }
 }
 
-void Global_THD_manager::dec_thread_running(THD *thd) const {
-  thd->set_is_running(false);
+void Global_THD_manager::dec_thread_running(THD *thd) {
+  if (my_cpu_is_hygon()) {
+    thd->set_is_running(false);
+  } else {
+    atomic_num_thread_running--;
+  }
 }
 
 void Global_THD_manager::release_thread_id(my_thread_id thread_id) {
