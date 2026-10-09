@@ -86,16 +86,6 @@ struct sync_cell_t {
   /** Destructor */
   ~sync_cell_t() UNIV_NOTHROW;
 
-  /** Enter/exit the cell mutex only for the selected locking policy.
-  Constant template arguments at call sites let the compiler remove the test. */
-  void enter(bool use_cell_mutex) {
-    if (use_cell_mutex) mutex.enter();
-  }
-
-  void exit(bool use_cell_mutex) {
-    if (use_cell_mutex) mutex.exit();
-  }
-
   sync_object_t latch;         /*!< pointer to the object the
                                thread is waiting for; if NULL
                                the cell is free for use */

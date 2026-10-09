@@ -37,7 +37,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
  Created 9/5/1995 Heikki Tuuri
  *******************************************************/
 
-#include "my_hygon.h"
 #include "sync0arr.h"
 
 #include <sys/types.h>
@@ -76,8 +75,7 @@ static bool sync_array_detect_deadlock(
                         own the mutex to array */
     sync_cell_t *start, /*!< in: cell where recursive search started */
     sync_cell_t *cell,  /*!< in: cell to search */
-    ulint depth,        /*!< in: recursion depth */
-    bool use_cell_mutex); /*!< in: selected cell locking policy */
+    ulint depth);       /*!< in: recursion depth */
 
 /** Validates the integrity of the wait array. Checks
  that the number of reserved cells equals the count variable. */
@@ -106,13 +104,13 @@ static void sync_array_validate(sync_array_t *arr) /*!< in: sync wait array */
 /** Constructor */
 sync_cell_t::sync_cell_t() UNIV_NOTHROW {
   /* Initialize the mutex for this cell */
-  if (my_cpu_is_hygon()) mutex.init();
+  mutex.init();
 }
 
 /** Destructor */
 sync_cell_t::~sync_cell_t() UNIV_NOTHROW {
   /* Free the mutex */
-  if (my_cpu_is_hygon()) mutex.destroy();
+  mutex.destroy();
 }
 
 /** Constructor
@@ -188,10 +186,7 @@ static os_event_t sync_cell_get_event(
 /** Reserves a wait array cell for waiting for an object.
  The event of the cell is reset to nonsignalled state.
  @return sync cell to wait on */
-/* C++14: the template argument fixes the locking protocol; only
-the public entry points perform runtime CPU selection. */
-template <bool UseCellMutex>
-static sync_cell_t *sync_array_reserve_cell_impl(
+sync_cell_t *sync_array_reserve_cell(
     sync_array_t *arr, /*!< in: wait array */
     void *object,      /*!< in: pointer to the object to wait for */
     ulint type,        /*!< in: lock request type */
@@ -225,13 +220,9 @@ static sync_cell_t *sync_array_reserve_cell_impl(
   ut_ad(arr->next_free_slot <= arr->n_cells);
 
   ++arr->n_reserved;
-#ifndef UNIV_DEBUG
-  /* Release keeps the array critical section limited to slot allocation. */
-  if (UseCellMutex) {
-    sync_array_exit(arr);
-  }
-#endif
-  cell->enter(UseCellMutex);
+  sync_array_exit(arr);
+
+  cell->mutex.enter();
   /* Reserve the cell. */
   ut_ad(cell->latch.mutex == nullptr);
 
@@ -249,25 +240,12 @@ static sync_cell_t *sync_array_reserve_cell_impl(
 
   cell->file = file;
   cell->line = line;
-  if (!UseCellMutex) {
-    sync_array_exit(arr);
-  }
+  cell->mutex.exit();
 
   cell->thread_id = std::this_thread::get_id();
 
   cell->reservation_time = ut_time_monotonic();
 
-  cell->exit(UseCellMutex);
-
-#ifdef UNIV_DEBUG
-  /* Release nested locks in reverse acquisition order. */
-  if (UseCellMutex) {
-    sync_array_exit(arr);
-  }
-#endif
-
-  /* The remaining event setup belongs to the reserving thread.
-  Diagnostics do not read signal_count; event reset has its own mutex. */
   /* Make sure the event is reset and also store the value of
   signal_count at which the event was reset. */
   os_event_t event = sync_cell_get_event(cell);
@@ -276,41 +254,21 @@ static sync_cell_t *sync_array_reserve_cell_impl(
   return (cell);
 }
 
-sync_cell_t *sync_array_reserve_cell(sync_array_t *arr, void *object,
-                                     ulint type, const char *file, ulint line) {
-  if (my_cpu_is_hygon()) {
-    return sync_array_reserve_cell_impl<true>(arr, object, type, file, line);
-  }
-  return sync_array_reserve_cell_impl<false>(arr, object, type, file, line);
-}
-
 /** Frees the cell. NOTE! sync_array_wait_event frees the cell
  automatically! */
-template <bool UseCellMutex>
-static void sync_array_free_cell_impl(
+void sync_array_free_cell(
     sync_array_t *arr,  /*!< in: wait array */
     sync_cell_t *&cell) /*!< in/out: the cell in the array */
 {
-#ifdef UNIV_DEBUG
-  /* Keep membership stable throughout recursive deadlock traversal. */
-  sync_array_enter(arr);
-#else
-  if (!UseCellMutex) {
-    sync_array_enter(arr);
-  }
-#endif
-  cell->enter(UseCellMutex);
+  cell->mutex.enter();
   ut_a(cell->latch.mutex != nullptr);
 
   cell->waiting = false;
   cell->signal_count = 0;
   cell->latch.mutex = nullptr;
-#ifndef UNIV_DEBUG
-  cell->exit(UseCellMutex);
-  if (UseCellMutex) {
-    sync_array_enter(arr);
-  }
-#endif
+  cell->mutex.exit();
+
+  sync_array_enter(arr);
   /* Setup the list of free slots in the array */
   cell->line = arr->first_free_slot;
 
@@ -318,9 +276,6 @@ static void sync_array_free_cell_impl(
 
   ut_a(arr->n_reserved > 0);
   arr->n_reserved--;
-#ifdef UNIV_DEBUG
-  cell->exit(UseCellMutex);
-#endif
 
   if (arr->next_free_slot > arr->n_cells / 2 && arr->n_reserved == 0) {
 #ifdef UNIV_DEBUG
@@ -340,37 +295,24 @@ static void sync_array_free_cell_impl(
   cell = nullptr;
 }
 
-void sync_array_free_cell(sync_array_t *arr, sync_cell_t *&cell) {
-  if (my_cpu_is_hygon()) {
-    return sync_array_free_cell_impl<true>(arr, cell);
-  }
-  return sync_array_free_cell_impl<false>(arr, cell);
-}
-
 /** This function should be called when a thread starts to wait on
  a wait array cell. In the debug version this function checks
  if the wait for a semaphore will result in a deadlock, in which
  case prints info and asserts. */
-template <bool UseCellMutex>
-static void sync_array_wait_event_impl(
+void sync_array_wait_event(
     sync_array_t *arr,  /*!< in: wait array */
     sync_cell_t *&cell) /*!< in: index of the reserved cell */
 {
-  if (!UseCellMutex) {
-    sync_array_enter(arr);
-  }
-  cell->enter(UseCellMutex);
+  cell->mutex.enter();
   ut_ad(!cell->waiting);
   ut_ad(cell->latch.mutex);
   ut_ad(std::this_thread::get_id() == cell->thread_id);
 
   cell->waiting = true;
-  cell->exit(UseCellMutex);
+  cell->mutex.exit();
 
 #ifdef UNIV_DEBUG
-  if (UseCellMutex) {
-    sync_array_enter(arr);
-  }
+  sync_array_enter(arr);
   /* We use simple enter to the mutex below, because if
   we cannot acquire it at once, mutex_enter would call
   recursively sync_array routines, leading to trouble.
@@ -378,7 +320,7 @@ static void sync_array_wait_event_impl(
 
   rw_lock_debug_mutex_enter();
 
-  if (sync_array_detect_deadlock(arr, cell, cell, 0, UseCellMutex)) {
+  if (sync_array_detect_deadlock(arr, cell, cell, 0)) {
 #ifdef UNIV_NO_ERR_MSGS
     ib::fatal()
 #else
@@ -389,13 +331,8 @@ static void sync_array_wait_event_impl(
   }
 
   rw_lock_debug_mutex_exit();
-  if (UseCellMutex) {
-    sync_array_exit(arr);
-  }
+  sync_array_exit(arr);
 #endif /* UNIV_DEBUG */
-  if (!UseCellMutex) {
-    sync_array_exit(arr);
-  }
 
   os_event_wait_low(sync_cell_get_event(cell), cell->signal_count);
 
@@ -404,27 +341,12 @@ static void sync_array_wait_event_impl(
   cell = nullptr;
 }
 
-void sync_array_wait_event(sync_array_t *arr, sync_cell_t *&cell) {
-  if (my_cpu_is_hygon()) {
-    return sync_array_wait_event_impl<true>(arr, cell);
-  }
-  return sync_array_wait_event_impl<false>(arr, cell);
-}
-
-/* Use the cell mutex when requested. Pass false if the caller already
-   holds the cell mutex, or if the array mutex provides protection. */
-static void sync_array_cell_print_impl(FILE *file, sync_cell_t *cell,
-                                       bool use_cell_mutex) {
+void sync_array_cell_print(FILE *file, sync_cell_t *cell) {
   rw_lock_t *rwlock;
   ulint type;
   ulint writer;
 
-  cell->enter(use_cell_mutex);
-  /* A waiter can finish between diagnostic selection and this lock. */
-  if (cell->latch.mutex == nullptr) {
-    cell->exit(use_cell_mutex);
-    return;
-  }
+  cell->mutex.enter();
   type = cell->request_type;
 
   fprintf(file,
@@ -528,32 +450,22 @@ static void sync_array_cell_print_impl(FILE *file, sync_cell_t *cell,
   if (!cell->waiting) {
     fputs("wait has ended\n", file);
   }
-  cell->exit(use_cell_mutex);
-}
-
-void sync_array_cell_print(FILE *file, sync_cell_t *cell) {
-  sync_array_cell_print_impl(file, cell, my_cpu_is_hygon());
+  cell->mutex.exit();
 }
 
 #ifdef UNIV_DEBUG
-/* Pass the caller's locking policy through recursion and diagnostics. */
 /** Looks for a cell with the given thread id.
- @return pointer to cell or nullptr if not found */
+ @return pointer to cell or NULL if not found */
 static sync_cell_t *sync_array_find_thread(
     sync_array_t *arr,      /*!< in: wait array */
-    std::thread::id thread, /*!< in: thread id */
-    bool use_cell_mutex)   /*!< in: selected cell locking policy */
+    std::thread::id thread) /*!< in: thread id */
 {
-  for (ulint i = 0; i < arr->next_free_slot; i++) {
+  for (ulint i = 0; i <= arr->next_free_slot; i++) {
     sync_cell_t *cell;
 
     cell = sync_array_get_nth_cell(arr, i);
 
-    cell->enter(use_cell_mutex);
-    const bool found =
-        cell->latch.mutex != nullptr && cell->thread_id == thread;
-    cell->exit(use_cell_mutex);
-    if (found) {
+    if (cell->latch.mutex != nullptr && cell->thread_id == thread) {
       return (cell); /* Found */
     }
   }
@@ -570,8 +482,7 @@ static ibool sync_array_deadlock_step(
                             started */
     std::thread::id thread, /*!< in: thread to look at */
     ulint pass,             /*!< in: pass value */
-    ulint depth,            /*!< in: recursion depth */
-    bool use_cell_mutex)    /*!< in: selected cell locking policy */
+    ulint depth)            /*!< in: recursion depth */
 {
   sync_cell_t *new_cell;
 
@@ -583,7 +494,7 @@ static ibool sync_array_deadlock_step(
     return (FALSE);
   }
 
-  new_cell = sync_array_find_thread(arr, thread, use_cell_mutex);
+  new_cell = sync_array_find_thread(arr, thread);
 
   if (new_cell == start) {
     /* Deadlock */
@@ -595,8 +506,7 @@ static ibool sync_array_deadlock_step(
     return (TRUE);
 
   } else if (new_cell) {
-    return sync_array_detect_deadlock(arr, start, new_cell, depth + 1,
-                                      use_cell_mutex);
+    return (sync_array_detect_deadlock(arr, start, new_cell, depth + 1));
   }
   return (FALSE);
 }
@@ -605,12 +515,11 @@ static ibool sync_array_deadlock_step(
 Report an error to stderr.
 @param lock		rw-lock instance
 @param debug		rw-lock debug information
-@param cell		thread context
-@param use_cell_mutex selected cell locking policy */
+@param cell		thread context */
 static void sync_array_report_error(rw_lock_t *lock, rw_lock_debug_t *debug,
-                                    sync_cell_t *cell, bool use_cell_mutex) {
+                                    sync_cell_t *cell) {
   fprintf(stderr, "rw-lock %p ", (void *)lock);
-  sync_array_cell_print_impl(stderr, cell, use_cell_mutex);
+  sync_array_cell_print(stderr, cell);
   rw_lock_debug_print(stderr, debug);
 }
 
@@ -622,29 +531,25 @@ static bool sync_array_detect_deadlock(
                         own the mutex to array */
     sync_cell_t *start, /*!< in: cell where recursive search started */
     sync_cell_t *cell,  /*!< in: cell to search */
-    ulint depth,        /*!< in: recursion depth */
-    bool use_cell_mutex) /*!< in: selected cell locking policy */
+    ulint depth)        /*!< in: recursion depth */
 {
   rw_lock_t *lock;
   std::thread::id thread;
   ibool ret;
   rw_lock_debug_t *debug;
 
-  cell->enter(use_cell_mutex);
+  cell->mutex.enter();
   ut_a(arr);
   ut_a(start);
   ut_a(cell);
-  if (!use_cell_mutex) {
-    ut_ad(cell->latch.mutex != nullptr);
-  }
   ut_ad(start->thread_id == std::this_thread::get_id());
   ut_ad(depth < 100);
 
   depth++;
 
-  if (!cell->waiting || (use_cell_mutex && cell->latch.mutex == nullptr)) {
+  if (!cell->waiting || cell->latch.mutex == nullptr) {
     /* No deadlock here */
-    cell->exit(use_cell_mutex);
+    cell->mutex.exit();
     return (false);
   }
 
@@ -652,7 +557,7 @@ static bool sync_array_detect_deadlock(
     case SYNC_MUTEX: {
       WaitMutex *mutex = cell->latch.mutex;
       const WaitMutex::MutexPolicy &policy = mutex->policy();
-      cell->exit(use_cell_mutex);
+      cell->mutex.exit();
 
       if (mutex->state() != MUTEX_STATE_UNLOCKED) {
         thread = policy.get_thread_id();
@@ -664,8 +569,7 @@ static bool sync_array_detect_deadlock(
         released the mutex: in this case no deadlock
         can occur, as the wait array cannot contain
         a thread with ID_UNDEFINED value. */
-        ret = sync_array_deadlock_step(arr, start, thread, 0, depth,
-                                       use_cell_mutex);
+        ret = sync_array_deadlock_step(arr, start, thread, 0, depth);
 
         if (ret) {
           const char *name;
@@ -689,7 +593,7 @@ static bool sync_array_detect_deadlock(
               << thread << " file " << name << " line "
               << policy.get_enter_line();
 
-          sync_array_cell_print_impl(stderr, cell, use_cell_mutex);
+          sync_array_cell_print(stderr, cell);
 
           return (true);
         }
@@ -702,7 +606,7 @@ static bool sync_array_detect_deadlock(
     case SYNC_BUF_BLOCK: {
       BlockWaitMutex *mutex = cell->latch.bpmutex;
       const BlockWaitMutex::MutexPolicy &policy = mutex->policy();
-      cell->exit(use_cell_mutex);
+      cell->mutex.exit();
 
       if (mutex->state() != MUTEX_STATE_UNLOCKED) {
         thread = policy.get_thread_id();
@@ -714,8 +618,7 @@ static bool sync_array_detect_deadlock(
         released the mutex: in this case no deadlock
         can occur, as the wait array cannot contain
         a thread with ID_UNDEFINED value. */
-        ret = sync_array_deadlock_step(arr, start, thread, 0, depth,
-                                       use_cell_mutex);
+        ret = sync_array_deadlock_step(arr, start, thread, 0, depth);
 
         if (ret) {
           const char *name;
@@ -739,7 +642,7 @@ static bool sync_array_detect_deadlock(
               << thread << " file " << name << " line "
               << policy.get_enter_line();
 
-          sync_array_cell_print_impl(stderr, cell, use_cell_mutex);
+          sync_array_cell_print(stderr, cell);
 
           return (true);
         }
@@ -752,7 +655,7 @@ static bool sync_array_detect_deadlock(
     case RW_LOCK_X_WAIT:
 
       lock = cell->latch.lock;
-      cell->exit(use_cell_mutex);
+      cell->mutex.exit();
 
       for (debug = UT_LIST_GET_FIRST(lock->debug_list); debug != nullptr;
            debug = UT_LIST_GET_NEXT(list, debug)) {
@@ -774,11 +677,11 @@ static bool sync_array_detect_deadlock(
             (cannot be cell thread) (wait) x-lock or
             sx-lock, and he is blocked by start thread */
 
-            ret = sync_array_deadlock_step(arr, start, thread, debug->pass, depth,
-                                           use_cell_mutex);
+            ret = sync_array_deadlock_step(arr, start, thread, debug->pass,
+                                           depth);
 
             if (ret) {
-              sync_array_report_error(lock, debug, cell, use_cell_mutex);
+              sync_array_report_error(lock, debug, cell);
               rw_lock_debug_print(stderr, debug);
               return (TRUE);
             }
@@ -790,7 +693,7 @@ static bool sync_array_detect_deadlock(
     case RW_LOCK_SX:
 
       lock = cell->latch.lock;
-      cell->exit(use_cell_mutex);
+      cell->mutex.exit();
 
       for (debug = UT_LIST_GET_FIRST(lock->debug_list); debug != nullptr;
            debug = UT_LIST_GET_NEXT(list, debug)) {
@@ -810,11 +713,11 @@ static bool sync_array_detect_deadlock(
             holding (wait) x-lock or sx-lock, and he is
             blocked by start thread */
 
-            ret = sync_array_deadlock_step(arr, start, thread, debug->pass, depth,
-                                           use_cell_mutex);
+            ret = sync_array_deadlock_step(arr, start, thread, debug->pass,
+                                           depth);
 
             if (ret) {
-              sync_array_report_error(lock, debug, cell, use_cell_mutex);
+              sync_array_report_error(lock, debug, cell);
               return (TRUE);
             }
         }
@@ -825,7 +728,7 @@ static bool sync_array_detect_deadlock(
     case RW_LOCK_S:
 
       lock = cell->latch.lock;
-      cell->exit(use_cell_mutex);
+      cell->mutex.exit();
 
       for (debug = UT_LIST_GET_FIRST(lock->debug_list); debug != nullptr;
            debug = UT_LIST_GET_NEXT(list, debug)) {
@@ -838,11 +741,11 @@ static bool sync_array_detect_deadlock(
           holding (wait) x-lock, and he is blocked by
           start thread */
 
-          ret = sync_array_deadlock_step(arr, start, thread, debug->pass, depth,
-                                         use_cell_mutex);
+          ret =
+              sync_array_deadlock_step(arr, start, thread, debug->pass, depth);
 
           if (ret) {
-            sync_array_report_error(lock, debug, cell, use_cell_mutex);
+            sync_array_report_error(lock, debug, cell);
             return (TRUE);
           }
         }
@@ -851,13 +754,12 @@ static bool sync_array_detect_deadlock(
       return (false);
 
     default:
-      cell->exit(use_cell_mutex);
+      cell->mutex.exit();
       ut_error;
   }
 
   return (true);
 }
-
 #endif /* UNIV_DEBUG */
 
 /** Determines if we can wake up the thread waiting for a semaphore. */
@@ -937,24 +839,15 @@ void sync_array_object_signalled() { ++sg_count; }
  Note that there's a race condition between this thread and mutex_exit
  changing the lock_word and calling signal_object, so sometimes this finds
  threads to wake up even when nothing has gone wrong. */
-template <bool UseCellMutex>
-static void sync_array_wake_threads_if_sema_free_low_impl(
+static void sync_array_wake_threads_if_sema_free_low(
     sync_array_t *arr) /* in/out: wait array */
 {
-  /* Snapshot the scan bound under its protecting mutex. The fixed cell
-  allocation remains valid while cells are freed or reused. */
-  sync_array_enter(arr);
-  const ulint scan_limit = arr->next_free_slot;
-  if (UseCellMutex) {
-    sync_array_exit(arr);
-  }
-
-  for (ulint i = 0; i < scan_limit; ++i) {
+  for (ulint i = 0; i < arr->next_free_slot; ++i) {
     sync_cell_t *cell;
 
     cell = sync_array_get_nth_cell(arr, i);
 
-    cell->enter(UseCellMutex);
+    cell->mutex.enter();
     if (cell->latch.mutex != nullptr && sync_arr_cell_can_wake_up(cell)) {
       os_event_t event;
 
@@ -962,19 +855,8 @@ static void sync_array_wake_threads_if_sema_free_low_impl(
 
       os_event_set(event);
     }
-    cell->exit(UseCellMutex);
+    cell->mutex.exit();
   }
-
-  if (!UseCellMutex) {
-    sync_array_exit(arr);
-  }
-}
-
-static void sync_array_wake_threads_if_sema_free_low(sync_array_t *arr) {
-  if (my_cpu_is_hygon()) {
-    return sync_array_wake_threads_if_sema_free_low_impl<true>(arr);
-  }
-  return sync_array_wake_threads_if_sema_free_low_impl<false>(arr);
 }
 
 /** If the wakeup algorithm does not work perfectly at semaphore relases,
@@ -998,7 +880,6 @@ static bool sync_array_print_long_waits_low(
     const void **sema,       /*!< out: longest-waited-for semaphore */
     ibool *noticed)          /*!< out: TRUE if long wait noticed */
 {
-  const bool use_cell_mutex = my_cpu_is_hygon();
   ulint fatal_timeout = srv_fatal_semaphore_wait_threshold;
   bool fatal = false;
   uint64_t longest_diff = 0;
@@ -1026,11 +907,9 @@ static bool sync_array_print_long_waits_low(
 
     cell = sync_array_get_nth_cell(arr, i);
 
-    cell->enter(use_cell_mutex);
     latch = cell->latch.mutex;
 
     if (latch == nullptr || !cell->waiting) {
-      cell->exit(use_cell_mutex);
       continue;
     }
 
@@ -1046,8 +925,7 @@ static bool sync_array_print_long_waits_low(
 #endif /* UNIV_NO_ERR_MSGS */
           << "A long semaphore wait:";
 
-      /* The cell mutex is already held; do not acquire it twice. */
-      sync_array_cell_print_impl(stderr, cell, false);
+      sync_array_cell_print(stderr, cell);
       *noticed = TRUE;
     }
 
@@ -1060,7 +938,6 @@ static bool sync_array_print_long_waits_low(
       *sema = latch;
       *waiter = cell->thread_id;
     }
-    cell->exit(use_cell_mutex);
   }
 
 #undef SYNC_ARRAY_TIMEOUT
@@ -1130,17 +1007,21 @@ static void sync_array_print_info_low(
     FILE *file,        /*!< in: file where to print */
     sync_array_t *arr) /*!< in: wait array */
 {
+  ulint i;
+  ulint count = 0;
+
   fprintf(file, "OS WAIT ARRAY INFO: reservation count " ULINTPF "\n",
           arr->res_count);
 
-  /* n_reserved includes cells being published or retired. It is not a
-  count of the non-null latches observable by this scan. */
-  for (ulint i = 0; i < arr->next_free_slot; ++i) {
+  for (i = 0; count < arr->n_reserved; ++i) {
     sync_cell_t *cell;
 
     cell = sync_array_get_nth_cell(arr, i);
 
-    sync_array_cell_print(file, cell);
+    if (cell->latch.mutex != nullptr) {
+      count++;
+      sync_array_cell_print(file, cell);
+    }
   }
 }
 
