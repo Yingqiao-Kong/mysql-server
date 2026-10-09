@@ -32,6 +32,12 @@ ADD_CONVENIENCE_LIBRARY(my_hygon my_hygon.cc
   COMPILE_OPTIONS ${MY_HYGON_COMPILE_OPTIONS})
 UNSET(MY_HYGON_COMPILE_OPTIONS)
 
+# Require my_cpu_is_hygon before LTO processing, since OpenSSL may
+# pull in bundled zlib references later in the link.
+IF(MY_COMPILER_IS_GNU AND (WITH_LTO OR CMAKE_COMPILER_FLAG_WITH_LTO))
+  TARGET_LINK_LIBRARIES(my_hygon INTERFACE "-Wl,-u,my_cpu_is_hygon")
+ENDIF()
+
 SET(MY_TIME_SOURCES my_time.cc my_systime.cc)
 
 ADD_CONVENIENCE_LIBRARY(mytime ${MY_TIME_SOURCES})
