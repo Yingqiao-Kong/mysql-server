@@ -184,6 +184,8 @@ cmake .. \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=1 \
   -DCMAKE_INSTALL_PREFIX=$HOME/database/<根据当前workspace是mysql还是txsql来决定，如果是mysql，此处的目录名就是mysql；如果是txsql，此处的目录名就是txsql>/install/<【mysql】：按「mysql 安装路径（变体与版本标识）」节，拼入 <native|inhouse>/<版本号>/<base|dev/特性>；【txsql】：<如果当前分支没有新增的代码修改，目录名就是base；如果有代码修改，那目录名就是dev/<当上一级的目录名是dev时，则按当前新增或修改特性来命名这一级的目录名>> \
+  -DWITH_LTO=ON \
+  -DCMAKE_INSTALL_RPATH=<与 -DCMAKE_INSTALL_PREFIX 完全相同的路径>/lib/private \
   -DWITH_BOOST=/<当前workspace>/boost/boost_<版本号>
 ```
 
@@ -202,6 +204,23 @@ After a successful build, install binaries with the same parallelism:
 ```bash
 make install -j64
 ```
+
+### LTO 与 RPATH（固定要求）
+
+下面两项**每次 cmake 都必须带**，不因「用户没提」而省略：
+
+- `-DWITH_LTO=ON` —— 开启链接时优化。
+  - 仓库里该选项默认是 `OFF`（`CMakeLists.txt` 的 `WITH_LTO_DEFAULT`），`-DBUILD_CONFIG=mysql_release` 也不会把它打开，所以必须显式指定。
+  - 连带的预期变化：LTO 与 lld / gold 不兼容，仓库在 `WITH_LTO=ON` 时会自动把 `USE_LD_LLD`、`USE_LD_GOLD` 的默认值改为 `OFF`（同为 `CMakeLists.txt`），即退回默认的 bfd 链接器。这是正常的，**不要**再手动打开这两个链接器开关。
+  - 选项描述里写的适用范围是 gcc7/gcc8/gcc9；本机默认编译器是 gcc 10.3.1，已实际跑通 LTO 构建（见提交 `6d07afbb404`）。
+- `-DCMAKE_INSTALL_RPATH=<与 -DCMAKE_INSTALL_PREFIX 完全相同的路径>/lib/private` —— 把安装前缀下的 `lib/private` 写进二进制的 RPATH。
+  - 用途：给 `mysqld` 加 `setcap` 能力（如 `cap_sys_nice=ep`）后，进程进入 secure-execution 模式，动态加载器会忽略 `LD_LIBRARY_PATH`，`lib/private` 下的私有库（`libprotobuf-lite.so` 等）就只能靠 RPATH 定位。
+  - 写法：值 = `-DCMAKE_INSTALL_PREFIX` 的**同一个路径**再接 `/lib/private`。例：`-DCMAKE_INSTALL_PREFIX=$HOME/database/mysql/install/inhouse/8.0.25/dev/opt-realtime` 时，RPATH 取 `$HOME/database/mysql/install/inhouse/8.0.25/dev/opt-realtime/lib/private`。两处路径必须逐字一致，写绝对路径，不要写成相对路径或 `$ORIGIN`。
+  - 仓库自身的 `ADD_INSTALL_RPATH`（`cmake/install_macros.cmake`）会在此之上**追加** `$ORIGIN/../lib/private`，所以最终 RPATH 形如 `<安装前缀>/lib/private:$ORIGIN/../lib/private`，属正常结果，不要以为配重了。
+  - 校验（构建/安装后，只读检查，可随时做）：`readelf -d <安装前缀>/bin/mysqld | grep -i rpath`。
+  - 改这两项都属配置变更：增量重编必须先清掉 `CMakeCache.txt`（或删掉 `build` 目录）再 cmake，否则旧缓存不生效。
+
+> 作用范围：仅 **cmake 预设流程（mysql / txsql）**。polarDb 走 `build.sh`、不由本 skill 透传 cmake 变量，不加这两项。
 
 ### cmake 执行步骤
 
@@ -254,6 +273,8 @@ cmake .. \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=1 \
   -DCMAKE_INSTALL_PREFIX=$HOME/database/<根据当前workspace是mysql还是txsql来决定>/install/<【mysql】：<native|inhouse>/<版本号>/<按目录名规则>；【txsql】：<按目录名规则>> \
+  -DWITH_LTO=ON \
+  -DCMAKE_INSTALL_RPATH=<与 -DCMAKE_INSTALL_PREFIX 完全相同的路径>/lib/private \
   -DWITH_BOOST=/<当前workspace>/boost/boost_<版本号> \
   -DCMAKE_C_COMPILER=/usr/bin/gcc-9 \
   -DCMAKE_CXX_COMPILER=/usr/bin/g++-9
@@ -422,6 +443,7 @@ echo "系统空闲，开始执行编译"
 - **txsql**：走 cmake 预设，默认 `RelWithDebInfo`，`make -j64` + `make install -j64`，安装到 `~/database/txsql/install/base` 或 `~/database/txsql/install/dev/<特性名>`。
 - **编译前环境检查**：两种流程在 cmake 前（polarDb 即 `build.sh` 内部 cmake 前）均需确认 libnuma / libaio / patchelf / libtirpc-devel / rpcgen 已安装，缺失则先自动安装；无法安装则停止报告，详见「编译前环境检查」一节。
 - **指定编译器**：仅当用户明确要求时，在 cmake 命令追加 `-DCMAKE_C_COMPILER` / `-DCMAKE_CXX_COMPILER`（绝对路径，C/C++ 同版本），并清除旧 `CMakeCache.txt` 后重新 cmake；详见「编译器指定」一节。
+- **LTO 与 RPATH**：cmake 预设流程（mysql / txsql）的 cmake 命令**固定**带 `-DWITH_LTO=ON` 与 `-DCMAKE_INSTALL_RPATH=<与 CMAKE_INSTALL_PREFIX 相同的路径>/lib/private`——两者默认都不生效，必须显式指定；改这两项属配置变更，需清 `CMakeCache.txt` 重配，详见「LTO 与 RPATH（固定要求）」一节。
 - 修复编译错误时：改动范围尽量小，不借机做无关重构。
 - 回报时需包含：仓库类型（polarDb / cmake）、build 目录或 `build.sh`、最终安装前缀、是否成功。
 - **mysql 回报补充**：若为 mysql 仓库，回报时注明变体（`native` / `inhouse`）与提取到的版本号。

@@ -1,11 +1,17 @@
 #!/bin/bash
 ###############################################################################
 # sysbench_with_monitor.sh
-# 包装 localhost_run.sh，在测试前和测试运行期间监控系统负载。
+# 包装 sysbench 驱动「正本」（本脚本同目录下的 localhost_run.sh），
+# 在测试前和测试运行期间监控系统负载。
 # 若检测到高负载干扰（CPU 占用聚集 >3 核心或同名进程聚集 >5），
 # 则中止当前测试，等待负载降低后自动重启测试。
 #
-# 用法: ./sysbench_with_monitor.sh [localhost_run.sh 的参数]
+# 用法: <本目录>/sysbench_with_monitor.sh [驱动参数]
+#   * 驱动的正本 = 本脚本同目录的 localhost_run.sh；测试参数（sed）也只改正本。
+#   * 启动前自动把正本同步到部署副本 $HOME/database/<REPO>/test/sysbench/
+#     （驱动 + iostat hook 一起同步，幂等；见同目录 sync_localhost_run.sh；失败只告警、
+#      不中断测试）。
+#   * 日志 perf-monitored-<时间>.log 写在当前工作目录。
 ###############################################################################
 
 # ---------- 配置 ----------
@@ -136,12 +142,21 @@ wait_for_low_load() {
 
 RETRY_COUNT=0
 
-# 从当前工作目录查找 localhost_run.sh
-RUN_SH="$(pwd)/localhost_run.sh"
+# sysbench 只由 skill 的驱动「正本」执行：本脚本同目录下的 localhost_run.sh
+# （仓库正本 tools/skills/mysql-sysbench-test/scripts/localhost_run.sh）
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_SH="$SCRIPTS_DIR/localhost_run.sh"
 if [ ! -x "$RUN_SH" ]; then
-  echo "ERROR: 在当前目录 $(pwd) 下找不到可执行的 localhost_run.sh"
-  echo "请先 cd 到 $HOME/database/<REPO>/test/sysbench 目录再运行本脚本。"
+  echo "ERROR: 找不到可执行的驱动正本 $RUN_SH"
+  echo "请检查 skill 安装是否完整（仓库正本：tools/skills/mysql-sysbench-test/scripts/localhost_run.sh）。"
   exit 1
+fi
+
+# 启动前把正本同步到部署副本 test/sysbench/localhost_run.sh，保证两份保持一致。
+# 幂等：内容相同时不写入、不产生备份；同步失败只告警，本次测试仍按正本执行。
+if [ -x "$SCRIPTS_DIR/sync_localhost_run.sh" ]; then
+  "$SCRIPTS_DIR/sync_localhost_run.sh" --quiet \
+    || echo "[同步] WARNING: 正本 → 部署副本同步失败，本次测试仍按正本执行。"
 fi
 
 while true; do
