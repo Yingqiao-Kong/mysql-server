@@ -165,6 +165,8 @@ extern sync_array_t **sync_wait_array;
 sync_cell_t *sync_array_get_nth_cell(sync_array_t *arr, ulint n);
 
 /** Reports info of a wait array cell into a file.
+ On Hygon, acquires the cell mutex; the caller must not already hold it.
+ On other CPUs, the caller must hold the array mutex protecting the cell.
  @param[in] file File where to print.
  @param[in] cell Sync array cell to report.
  */
