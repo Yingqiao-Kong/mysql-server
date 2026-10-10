@@ -24,23 +24,33 @@ $HOME/database/<REPO>/
     └── sysbench/  # sysbench 测试脚本与历史日志
 ```
 
-两个 skill 本体（脚本模板的源头）位于 skills 目录：
+两个 skill 本体（全部脚本模板的源头）位于**本仓库**的 `tools/skills/` 下，随仓库一起进版本库：
 
 ```
-~/.claude/skills/
-├── mysql-build/
-│   └── SKILL.md                      # MySQL 编译流程说明
-└── mysql-sysbench-test/
-    ├── SKILL.md                      # sysbench 测试流程说明
-    └── scripts/
-        ├── launch.sh                 # MySQL 启动脚本模板
-        ├── localhost_run.sh          # sysbench 驱动脚本模板
-        ├── stop_user_mysqld.sh       # 关闭已有 mysqld 进程
-        ├── sysbench_with_monitor.sh  # 带负载监控的 sysbench 包装
-        └── parse_sysbench_tps.py     # TPS 解析与基准对比
+<仓库根>/
+└── tools/skills/
+    ├── mysql-build/
+    │   └── SKILL.md                        # MySQL 编译流程说明
+    ├── mysql-sysbench-test/
+    │   ├── SKILL.md                        # sysbench 测试流程说明
+    │   └── scripts/
+    │       ├── launch.sh                   # MySQL 启动脚本模板
+    │       ├── localhost_run.sh            # sysbench 驱动脚本（正本）
+    │       ├── iostat_run_monitor.sh       # run 阶段 iostat(w_await) 采集；驱动的 hook，必须与驱动同目录
+    │       ├── stop_user_mysqld.sh         # 关闭已有 mysqld 进程
+    │       ├── sysbench_with_monitor.sh    # 带负载监控的 sysbench 包装
+    │       ├── hotspot_probe.sh            # 热点摸底（perf 采样 + 归属判定）
+    │       ├── sync_localhost_run.sh       # 正本 → 部署副本（驱动 + hook 成对同步）
+    │       ├── list_install_versions.sh    # 扫描 install/ 下已构建的版本
+    │       └── parse_sysbench_tps.py       # TPS 解析与基准对比
+    └── mysql-build-and-sysbench-paths.md   # 本文档
 ```
 
-> 部署时，`launch.sh` 与 `localhost_run.sh` 会被拷贝到各 REPO 的 `install/` 与 `test/sysbench/` 下作为实际执行文件；skill 目录下的版本是「模板/参考」。
+> 宿主加载 skill 时经 `<仓库>/.claude/skills/<name>` 软链指向上面这些目录，解析后就是同一份文件，
+> **不存在第二个实体**。skill 用到的脚本与模板**全部来自本仓库**，不引用仓库外的安装副本。
+>
+> 部署时，`launch.sh` 与 `localhost_run.sh`（连同它的 hook `iostat_run_monitor.sh`）会被拷到各 REPO 的
+> `install/` 与 `test/sysbench/` 下作为实际执行文件；仓库里的版本是「正本」，**改动只改这一份**。
 
 ---
 
@@ -142,13 +152,13 @@ install/native/<version>/base/   # 或旧式 install/base/
 
 ## 4. 启动脚本存放位置
 
-### 4.1 skill 自带模板（源头）
+### 4.1 skill 自带脚本（正本，仓库内唯一真相）
 
 | 路径 | 功能 |
 |------|------|
-| `skills/mysql-sysbench-test/scripts/launch.sh` | MySQL 启动模板：清理并初始化数据目录 → 改写 my.cnf → 按需绑核 → `mysqld --initialize` + 后台启动 → 设置 root 密码 `123456` 与 sysbench/benchmarksql 账号 |
-| `skills/mysql-sysbench-test/scripts/stop_user_mysqld.sh` | launch 前必跑：关闭当前账户下所有 mysqld/mysqld_safe 进程，避免 socket/端口/数据目录冲突 |
-| `skills/mysql-sysbench-test/scripts/sysbench_with_monitor.sh` | 带负载监控的 sysbench 包装（测试前等待 + 运行中监控 + 中断重试） |
+| `tools/skills/mysql-sysbench-test/scripts/launch.sh` | MySQL 启动脚本正本（首次部署时拷到 `$HOME/database/<REPO>/install/launch.sh`）：清理并初始化数据目录 → 改写 my.cnf → 按需绑核 → `mysqld --initialize` + 后台启动 → 设置 root 密码 `123456` 与 sysbench/benchmarksql 账号 |
+| `tools/skills/mysql-sysbench-test/scripts/stop_user_mysqld.sh` | launch 前必跑：关闭当前账户下所有 mysqld/mysqld_safe 进程，避免 socket/端口/数据目录冲突 |
+| `tools/skills/mysql-sysbench-test/scripts/sysbench_with_monitor.sh` | 带负载监控的 sysbench 包装（测试前等待 + 运行中监控 + 中断重试） |
 
 ### 4.2 部署到仓库后的实际位置
 
@@ -177,13 +187,16 @@ install/native/<version>/base/   # 或旧式 install/base/
 
 ## 5. 测试脚本存放位置
 
-### 5.1 skill 自带脚本（源头）
+### 5.1 skill 自带脚本（正本，仓库内唯一真相）
 
 | 路径 | 功能 |
 |------|------|
-| `skills/mysql-sysbench-test/scripts/localhost_run.sh` | sysbench 驱动脚本（含全部参数：`bin_dir`/`lua_dir`/`socket`/`threads`/`tables`/`table_size`/`test_items`/`sysbench_bind_nodes` 等）；按脚本所在位置自动探测 `REPO`，同一份可在任一仓库下使用 |
-| `skills/mysql-sysbench-test/scripts/sysbench_with_monitor.sh` | 包装 `localhost_run.sh`：测试前 30s 间隔扫描负载等待、运行中每 10s 监控、超门限即中止并重试；输出 `perf-monitored-<日期时间>.log` |
-| `skills/mysql-sysbench-test/scripts/parse_sysbench_tps.py` | 解析 sysbench 日志中各并发的 TPS，与 baseline 文件对比，输出 Markdown 表（默认 ±3% 判定通过，`--threshold` 可调） |
+| `tools/skills/mysql-sysbench-test/scripts/localhost_run.sh` | sysbench 驱动脚本正本（含全部参数：`bin_dir`/`lua_dir`/`socket`/`threads`/`tables`/`table_size`/`test_items`/`sysbench_bind_nodes` 等）；按脚本所在位置自动探测 `REPO`，同一份可在任一仓库下使用 |
+| `tools/skills/mysql-sysbench-test/scripts/iostat_run_monitor.sh` | run 阶段 iostat（`w_await`）采集器 + 驱动的 hook；由 `--install` 把自己写进驱动、由 `--probe`/`--sample` 手工查盘 —— **必须与驱动同目录** |
+| `tools/skills/mysql-sysbench-test/scripts/hotspot_probe.sh` | 热点摸底：`perf` 采样 + 自旋/锁归属判定（单函数自占比 >30% 触发暂停） |
+| `tools/skills/mysql-sysbench-test/scripts/sync_localhost_run.sh` | 把正本（驱动 + hook 成对）同步到 `$HOME/database/<REPO>/test/sysbench/`；`--check` 只比较 |
+| `tools/skills/mysql-sysbench-test/scripts/sysbench_with_monitor.sh` | 包装 `localhost_run.sh`：测试前 30s 间隔扫描负载等待、运行中每 10s 监控、超门限即中止并重试；输出 `perf-monitored-<日期时间>.log` |
+| `tools/skills/mysql-sysbench-test/scripts/parse_sysbench_tps.py` | 解析 sysbench 日志中各并发的 TPS，与 baseline 文件对比，输出 Markdown 表（默认 ±3% 判定通过，`--threshold` 可调） |
 
 ### 5.2 sysbench 工具本体（外部依赖）
 
@@ -196,14 +209,15 @@ install/native/<version>/base/   # 或旧式 install/base/
 
 | 路径 | 功能 |
 |------|------|
-| `$HOME/database/<REPO>/test/sysbench/localhost_run.sh` | 实际执行的 sysbench 测试脚本（参数经 `sed` 修改后生效） |
+| `$HOME/database/<REPO>/test/sysbench/localhost_run.sh` | 部署副本：实际执行的 sysbench 测试脚本。参数在**正本**里 `sed` 改，再由 `sync_localhost_run.sh` 推过来；**不要直接改这里** |
+| `$HOME/database/<REPO>/test/sysbench/iostat_run_monitor.sh` | 部署副本的 iostat hook（与驱动**成对**同步；驱动按「与自身同目录」定位它，缺了只丢 `w_await` 行，不影响测试） |
 | `$HOME/database/<REPO>/test/sysbench/perf-monitored-*.log` | 监控脚本生成的本次测试日志（解析脚本输入） |
 | `$HOME/database/<REPO>/test/sysbench/perf-*.log`、`*-perf.txt` | 手动或历史测试日志（可作 baseline 对照） |
 | `$HOME/database/<REPO>/test/sysbench/base-*/binlog_order_commits-OFF/1skt-base.txt`、`2skt-base.txt` | 单路 / 双路基准 TPS 日志 |
 | `$HOME/database/<REPO>/test/sysbench/opt/...` | opt 构建的历史结果，亦可作对照 |
 | `txsql/test/sysbench/bench_*.sh`、`iterate_*.sh` | txsql 仓库自带的历史批跑脚本（非 skill 强制） |
 
-> **核心铁律**：sysbench 的 prepare / run / cleanup 一律通过 `localhost_run.sh` 执行，严禁自行构造 `sysbench ... run` 命令行。改参数用 `sed` 改 `localhost_run.sh` 中对应变量。
+> **核心铁律**：sysbench 的 prepare / run / cleanup 一律通过 `localhost_run.sh` 执行，严禁自行构造 `sysbench ... run` 命令行。改参数用 `sed` 改**正本**（`tools/skills/mysql-sysbench-test/scripts/localhost_run.sh`）中对应变量，再 `sync_localhost_run.sh` 同步到部署副本。
 
 ---
 
@@ -225,12 +239,13 @@ install/native/<version>/base/   # 或旧式 install/base/
 | 启动 | `$HOME/database/<REPO>/install/mysql.sock` | 全部 | 本地 socket |
 | 启动 | `$HOME/database/<REPO>/install/successive_run_sysbench.sh` | mysql/txsql | 一键多场景脚本 |
 | 存储 | launch.sh 中 `data_dir_base_path`/`log_dir_base_path` 配置的默认数据盘目录 | 全部 | data/log 落盘根（可被 ramfs/自定义盘覆盖） |
-| **测试** | `$HOME/database/<REPO>/test/sysbench/localhost_run.sh` | 全部 | sysbench 驱动脚本 |
+| **测试** | `$HOME/database/<REPO>/test/sysbench/localhost_run.sh` | 全部 | sysbench 驱动的部署副本（从 skill 正本同步而来，别直接改） |
+| 测试 | `$HOME/database/<REPO>/test/sysbench/iostat_run_monitor.sh` | 全部 | 部署副本的 iostat hook（与驱动成对同步） |
 | 测试 | `$HOME/database/<REPO>/test/sysbench/perf-monitored-*.log` | 全部 | 本次监控测试日志 |
 | 测试 | `$HOME/database/<REPO>/test/sysbench/base-*/.../1skt-base.txt` | 全部 | 基准 TPS 日志 |
 | 工具 | `$HOME/tools/sysbench-master/install/{bin,share/sysbench}` | 公共 | sysbench 可执行文件 + lua 脚本 |
-| skill | `~/.claude/skills/mysql-build/SKILL.md` | — | 编译流程说明 |
-| skill | `~/.claude/skills/mysql-sysbench-test/scripts/*` | — | launch/localhost_run/监控/解析 模板源头 |
+| skill | `<仓库根>/tools/skills/mysql-build/SKILL.md` | — | 编译流程说明 |
+| skill | `<仓库根>/tools/skills/mysql-sysbench-test/scripts/*` | — | 全部 skill 脚本的正本（唯一真相，改动只改这里） |
 
 ---
 
@@ -248,7 +263,7 @@ install/native/<version>/base/   # 或旧式 install/base/
    - launch 改写 `install/my.cnf`，初始化 `STORAGE_PATH/data`，后台拉起 `install/<ver>/bin/mysqld`，socket 落在 `install/mysql.sock`
 
 3. **测试**（步骤 2）
-   - `sed` 改 `$HOME/database/<REPO>/test/sysbench/localhost_run.sh` 的 `threads`/`test_items`/`sysbench_bind_nodes`/`tables`/`table_size`
+   - `sed` 改**正本** `tools/skills/mysql-sysbench-test/scripts/localhost_run.sh` 的 `threads`/`test_items`/`sysbench_bind_nodes`/`tables`/`table_size`，再 `sync_localhost_run.sh` 推到部署副本 `$HOME/database/<REPO>/test/sysbench/`
    - `cd $HOME/database/<REPO>/test/sysbench && sysbench_with_monitor.sh` → 产出 `perf-monitored-*.log`（用 `$HOME/tools/sysbench-master/install/bin/sysbench` + lua）
 
 4. **对比**（步骤 3）
