@@ -34,6 +34,8 @@
 class Slave_worker;
 class Commit_order_manager;
 
+bool Commit_stage_manager::binlog_group_commit_stats_enabled = false;
+
 int g_max_numa_num = 0;
 bool g_binlog_numa_initialized = false;
 thread_local int thread_numa_id = 0;
@@ -485,14 +487,40 @@ void Commit_stage_manager::wait_count_or_timeout(ulong count, long usec,
   }
 }
 
+void Commit_stage_manager::update_group_commit_stats(StageID stage,
+                                                     int32 count) {
+  if (!binlog_group_commit_stats_enabled) return;
+
+  /* COMMIT_ORDER_FLUSH_STAGE is not shown by SHOW STATUS. */
+  if (count <= 0 || stage == COMMIT_ORDER_FLUSH_STAGE) return;
+
+  Binlog_group_commit_stats &stats = m_group_commit_stats[stage];
+  stats.group_count.fetch_add(1, std::memory_order_relaxed);
+  stats.transaction_count.fetch_add(static_cast<ulonglong>(count),
+                                    std::memory_order_relaxed);
+}
+
 THD *Commit_stage_manager::fetch_queue_acquire_lock(StageID stage) {
   DBUG_PRINT("debug", ("Fetching queue for stage %d", stage));
-  return m_queue[stage].fetch_and_empty_acquire_lock();
+  /*
+    The size of the queue is the size of the group taken from it, and it is
+    reset by the fetch, so read it while the queue lock is held.
+  */
+  m_queue[stage].lock();
+  const int32 count = m_queue[stage].get_size();
+  THD *first = m_queue[stage].fetch_and_empty_skip_acquire_lock();
+  m_queue[stage].unlock();
+  update_group_commit_stats(stage, count);
+  return first;
 }
 
 THD *Commit_stage_manager::fetch_queue_skip_acquire_lock(StageID stage) {
   DBUG_PRINT("debug", ("Fetching queue for stage %d", stage));
-  return m_queue[stage].fetch_and_empty_skip_acquire_lock();
+  /* The caller holds the queue lock, see fetch_queue_acquire_lock(). */
+  const int32 count = m_queue[stage].get_size();
+  THD *first = m_queue[stage].fetch_and_empty_skip_acquire_lock();
+  update_group_commit_stats(stage, count);
+  return first;
 }
 
 THD *Commit_stage_manager::fetch_numa_queue_acquire_lock(StageID stage, int numa_id) {
