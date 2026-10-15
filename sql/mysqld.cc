@@ -9006,6 +9006,63 @@ static int show_slave_open_temp_tables(THD *, SHOW_VAR *var, char *buf) {
 }
 
 /*
+  The group commit statistics are read through a function since they are
+  atomics, updated by the stage leader while SHOW STATUS reads them without
+  any lock, so they cannot be shown by address.
+*/
+static int show_binlog_group_commit_stat(SHOW_VAR *var, char *buf,
+                                         ulonglong stat) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((ulonglong *)buf) = stat;
+  return 0;
+}
+
+static int show_binlog_group_commit_commit_group_count(THD *, SHOW_VAR *var,
+                                                       char *buf) {
+  return show_binlog_group_commit_stat(
+      var, buf, Commit_stage_manager::get_instance().get_group_count(
+                    Commit_stage_manager::COMMIT_STAGE));
+}
+
+static int show_binlog_group_commit_commit_transaction_count(THD *,
+                                                             SHOW_VAR *var,
+                                                             char *buf) {
+  return show_binlog_group_commit_stat(
+      var, buf, Commit_stage_manager::get_instance().get_transaction_count(
+                    Commit_stage_manager::COMMIT_STAGE));
+}
+
+static int show_binlog_group_commit_flush_group_count(THD *, SHOW_VAR *var,
+                                                      char *buf) {
+  return show_binlog_group_commit_stat(
+      var, buf, Commit_stage_manager::get_instance().get_group_count(
+                    Commit_stage_manager::BINLOG_FLUSH_STAGE));
+}
+
+static int show_binlog_group_commit_flush_transaction_count(THD *,
+                                                            SHOW_VAR *var,
+                                                            char *buf) {
+  return show_binlog_group_commit_stat(
+      var, buf, Commit_stage_manager::get_instance().get_transaction_count(
+                    Commit_stage_manager::BINLOG_FLUSH_STAGE));
+}
+
+static int show_binlog_group_commit_sync_group_count(THD *, SHOW_VAR *var,
+                                                     char *buf) {
+  return show_binlog_group_commit_stat(
+      var, buf, Commit_stage_manager::get_instance().get_group_count(
+                    Commit_stage_manager::SYNC_STAGE));
+}
+
+static int show_binlog_group_commit_sync_transaction_count(THD *, SHOW_VAR *var,
+                                                           char *buf) {
+  return show_binlog_group_commit_stat(
+      var, buf, Commit_stage_manager::get_instance().get_transaction_count(
+                    Commit_stage_manager::SYNC_STAGE));
+}
+
+/*
   Variables shown by SHOW STATUS in alphabetical order
 */
 
@@ -9031,6 +9088,24 @@ SHOW_VAR status_vars[] = {
     {"Binlog_cache_disk_use", (char *)&binlog_cache_disk_use, SHOW_LONG,
      SHOW_SCOPE_GLOBAL},
     {"Binlog_cache_use", (char *)&binlog_cache_use, SHOW_LONG,
+     SHOW_SCOPE_GLOBAL},
+    {"Binlog_group_commit_commit_group_count",
+     (char *)&show_binlog_group_commit_commit_group_count, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Binlog_group_commit_commit_transaction_count",
+     (char *)&show_binlog_group_commit_commit_transaction_count, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Binlog_group_commit_flush_group_count",
+     (char *)&show_binlog_group_commit_flush_group_count, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Binlog_group_commit_flush_transaction_count",
+     (char *)&show_binlog_group_commit_flush_transaction_count, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Binlog_group_commit_sync_group_count",
+     (char *)&show_binlog_group_commit_sync_group_count, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Binlog_group_commit_sync_transaction_count",
+     (char *)&show_binlog_group_commit_sync_transaction_count, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"Binlog_stmt_cache_disk_use", (char *)&binlog_stmt_cache_disk_use,
      SHOW_LONG, SHOW_SCOPE_GLOBAL},

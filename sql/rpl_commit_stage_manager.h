@@ -354,6 +354,42 @@ class Commit_stage_manager {
   void unlock_queue(StageID stage) { m_queue[stage].unlock(); }
   void unlock_numa_queue(StageID stage, int numa_id) { m_numa_queue[numa_id][stage].unlock(); }
 
+  /**
+    Get the number of groups the stage leader has taken out of the stage
+    queue.
+
+    @param[in]  stage  Stage identifier whose statistics are asked for.
+
+    @return Number of groups taken.
+
+    @note This is a dirty read: the counters are not read under any lock.
+  */
+  ulonglong get_group_count(StageID stage) const {
+    return m_group_commit_stats[stage].group_count.load();
+  }
+
+  /**
+    Get the number of transactions in the groups the stage leader has taken
+    out of the stage queue.
+
+    @param[in]  stage  Stage identifier whose statistics are asked for.
+
+    @return Number of transactions in the groups taken.
+
+    @note This is a dirty read: the counters are not read under any lock.
+  */
+  ulonglong get_transaction_count(StageID stage) const {
+    return m_group_commit_stats[stage].transaction_count.load();
+  }
+
+  /**
+    System variable: whether the statistics of the group commit stages are
+    collected, off by default.
+
+    Read by update_group_commit_stats() without the stage queue lock.
+  */
+  static bool binlog_group_commit_stats_enabled;
+
  private:
   /** Implement the locking policy selected by the public entry points. */
   template <bool UseThreadMutex>
@@ -362,6 +398,20 @@ class Commit_stage_manager {
 
   template <bool UseThreadMutex>
   void signal_done_impl(THD *queue, StageID stage);
+
+  /**
+    Account a group of transactions taken out of a stage queue to the group
+    commit statistics of that stage.
+
+    Called with the stage queue lock held, so for a given stage there is a
+    single caller at a time. The stages which are not shown by SHOW STATUS are
+    ignored, and so is everything when the binlog_group_commit_stats system
+    variable is disabled.
+
+    @param[in]  stage  Stage the taken queue belongs to.
+    @param[in]  count  Number of transactions in the taken group.
+  */
+  void update_group_commit_stats(StageID stage, int32 count);
 
   /** check if Commit_stage_manager variables already initalized. */
   bool m_is_initialized;
@@ -410,6 +460,30 @@ class Commit_stage_manager {
   /** Mutex used for the stage level locks */
   mysql_mutex_t m_queue_lock[STAGE_COUNTER - 1];
   mysql_mutex_t (*m_numa_queue_lock)[STAGE_COUNTER - 1];
+
+  /**
+     Group commit statistics of one stage: how many transactions the stage
+     leader has taken out of the stage queue, in how many groups. Both are
+     cumulative counters, so from two samples a client can work out the
+     average size of a group over the period between them.
+
+     The leader accounts the group it takes with the stage queue lock held, so
+     for a given stage there is a single updater at a time. The values are read
+     by SHOW STATUS without any lock, hence the atomic members.
+  */
+  struct Binlog_group_commit_stats {
+    /** Number of groups taken. */
+    std::atomic<ulonglong> group_count{0};
+    /** Number of transactions in the groups taken. */
+    std::atomic<ulonglong> transaction_count{0};
+  };
+
+  /**
+     Group commit statistics of each stage, indexed by StageID. The stages
+     which are not shown by SHOW STATUS are left out, see
+     update_group_commit_stats().
+  */
+  Binlog_group_commit_stats m_group_commit_stats[STAGE_COUNTER];
 
 #ifndef NDEBUG
   /** Save pointer to leader thread which is used later to awake leader */

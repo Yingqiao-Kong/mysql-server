@@ -109,6 +109,7 @@
 #include "sql/protocol_classic.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_options.h"
+#include "sql/rpl_commit_stage_manager.h"  // Commit_stage_manager
 #include "sql/rpl_group_replication.h"  // is_group_replication_running
 #include "sql/rpl_handler.h"            // delegates_update_lock_type
 #include "sql/rpl_info_factory.h"       // Rpl_info_factory
@@ -1087,6 +1088,15 @@ static Sys_var_ulong Sys_binlog_group_commit_sync_no_delay_count(
     GLOBAL_VAR(opt_binlog_group_commit_sync_no_delay_count),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 100000 /* max connections */),
     DEFAULT(0), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_bool Sys_binlog_group_commit_stats(
+    "binlog_group_commit_stats",
+    "Collect the statistics of the binary log group commit stages, which are"
+    " shown by the Binlog_group_commit_* status variables. Off by default: set"
+    " it to ON to collect them, at the cost of the accounting in the group"
+    " commit path.",
+    GLOBAL_VAR(Commit_stage_manager::binlog_group_commit_stats_enabled),
+    CMD_LINE(OPT_ARG), DEFAULT(false));
 
 static bool check_outside_trx(sys_var *, THD *thd, set_var *var) {
   if (thd->in_active_multi_stmt_transaction()) {
