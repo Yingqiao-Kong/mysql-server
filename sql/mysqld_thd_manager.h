@@ -151,7 +151,14 @@ class Global_THD_manager {
     Retrieves thread running statistic variable.
     @return int Returns the total number of threads currently running
   */
-  int get_num_thread_running();
+  int get_num_thread_running() const { return atomic_num_thread_running; }
+
+  /**
+    Refresh the Hygon running-thread sample before acquiring LOCK_thd_data.
+    Status materialization holds LOCK_status across sampling and callbacks.
+    Non-Hygon CPUs retain the existing continuously maintained counter.
+  */
+  void count_num_thread_running();
 
   /**
     Increments thread running statistic variable.

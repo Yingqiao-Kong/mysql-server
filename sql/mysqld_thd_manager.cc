@@ -234,8 +234,8 @@ my_thread_id Global_THD_manager::get_new_thread_id() {
   return new_id;
 }
 
-int Global_THD_manager::get_num_thread_running() {
-  if (!my_cpu_is_hygon()) return atomic_num_thread_running;
+void Global_THD_manager::count_num_thread_running() {
+  if (!my_cpu_is_hygon()) return;
   int num = 0;
   for (int i = 0; i < NUM_PARTITIONS; i++) {
     mysql_mutex_lock(&LOCK_thd_list[i]);
@@ -246,7 +246,7 @@ int Global_THD_manager::get_num_thread_running() {
     }
     mysql_mutex_unlock(&LOCK_thd_list[i]);
   }
-  return num;
+  atomic_num_thread_running = num;
 }
 
 void Global_THD_manager::inc_thread_running(THD *thd) {

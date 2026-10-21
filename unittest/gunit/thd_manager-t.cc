@@ -86,12 +86,51 @@ TEST_F(ThreadManagerTest, IncDecThreadRunning) {
   THD thd1(false);
   thd1.set_new_thread_id();
   thd_manager->add_thd(&thd1);
+  thd_manager->count_num_thread_running();
   EXPECT_EQ(0, thd_manager->get_num_thread_running());
   thd_manager->inc_thread_running(&thd1);
+  thd_manager->count_num_thread_running();
   EXPECT_EQ(1, thd_manager->get_num_thread_running());
   thd_manager->dec_thread_running(&thd1);
+  thd_manager->count_num_thread_running();
   EXPECT_EQ(0, thd_manager->get_num_thread_running());
   thd_manager->remove_thd(&thd1);
+}
+
+TEST_F(ThreadManagerTest, SampleMultipleRunningThreads) {
+  THD thd1(false), thd2(false), thd3(false);
+  THD *threads[] = {&thd1, &thd2, &thd3};
+  for (THD *thd : threads) {
+    thd->set_new_thread_id();
+    thd_manager->add_thd(thd);
+  }
+  thd_manager->count_num_thread_running();
+  EXPECT_EQ(0, thd_manager->get_num_thread_running());
+  thd_manager->inc_thread_running(&thd1);
+  thd_manager->inc_thread_running(&thd3);
+  thd_manager->count_num_thread_running();
+  EXPECT_EQ(2, thd_manager->get_num_thread_running());
+  thd_manager->dec_thread_running(&thd1);
+  thd_manager->count_num_thread_running();
+  EXPECT_EQ(1, thd_manager->get_num_thread_running());
+  thd_manager->dec_thread_running(&thd3);
+  for (THD *thd : threads) thd_manager->remove_thd(thd);
+  thd_manager->count_num_thread_running();
+  EXPECT_EQ(0, thd_manager->get_num_thread_running());
+}
+
+TEST_F(ThreadManagerTest, ReadSampleWhileHoldingThdData) {
+  THD thd(false);
+  thd.set_new_thread_id();
+  thd_manager->add_thd(&thd);
+  thd_manager->inc_thread_running(&thd);
+  thd_manager->count_num_thread_running();
+  mysql_mutex_lock(&thd.LOCK_thd_data);
+  EXPECT_EQ(1, thd_manager->get_num_thread_running());
+  mysql_mutex_unlock(&thd.LOCK_thd_data);
+  thd_manager->dec_thread_running(&thd);
+  thd_manager->remove_thd(&thd);
+  thd_manager->count_num_thread_running();
 }
 
 TEST_F(ThreadManagerTest, IncThreadCreated) {

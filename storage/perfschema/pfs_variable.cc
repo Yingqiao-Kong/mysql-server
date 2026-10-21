@@ -1135,6 +1135,10 @@ int PFS_status_variable_cache::do_materialize_global(void) {
   /* Acquire LOCK_status to guard against plugin load/unload. */
   if (m_current_thd->fill_status_recursion_level++ == 0) {
     mysql_mutex_lock(&LOCK_status);
+    /* Sample before get_THD() can take LOCK_thd_data. Nested status
+       materialization reuses the outer sample instead of reacquiring a
+       thread-list lock while an outer callback may hold LOCK_thd_data. */
+    Global_THD_manager::get_instance()->count_num_thread_running();
   }
 
   /*
@@ -1189,6 +1193,10 @@ int PFS_status_variable_cache::do_materialize_all(THD *unsafe_thd) {
   /* Avoid recursive acquisition of LOCK_status. */
   if (m_current_thd->fill_status_recursion_level++ == 0) {
     mysql_mutex_lock(&LOCK_status);
+    /* Sample before get_THD() can take LOCK_thd_data. Nested status
+       materialization reuses the outer sample instead of reacquiring a
+       thread-list lock while an outer callback may hold LOCK_thd_data. */
+    Global_THD_manager::get_instance()->count_num_thread_running();
   }
 
   /*
