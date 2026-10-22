@@ -1,0 +1,24 @@
+###############################################################################
+# Testing the new variable binlog_group_commit_stats
+###############################################################################
+
+--echo # Default values
+SELECT @@GLOBAL.binlog_group_commit_stats;
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SELECT @@SESSION.binlog_group_commit_stats;
+
+--disable_query_log
+SET @saved_value = @@global.binlog_group_commit_stats;
+--enable_query_log
+
+--echo # Valid values
+SET GLOBAL binlog_group_commit_stats = ON;
+SELECT @@GLOBAL.binlog_group_commit_stats;
+SET GLOBAL binlog_group_commit_stats = OFF;
+SELECT @@GLOBAL.binlog_group_commit_stats;
+
+--echo # The statistics are shown by six global status variables
+SELECT COUNT(*) FROM performance_schema.global_status
+  WHERE VARIABLE_NAME LIKE 'Binlog_group_commit%';
+
+SET GLOBAL binlog_group_commit_stats = @saved_value;

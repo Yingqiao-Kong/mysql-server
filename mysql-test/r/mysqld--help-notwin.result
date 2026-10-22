@@ -134,6 +134,12 @@ The following options may be given as the first argument:
  binlog-format is MIXED, the format switches to row-based
  and back implicitly per each query accessing an
  NDBCLUSTER table
+ --binlog-group-commit-stats 
+ Collect the statistics of the binary log group commit
+ stages, which are shown by the Binlog_group_commit_*
+ status variables. Off by default: set it to ON to collect
+ them, at the cost of the accounting in the group commit
+ path.
  --binlog-group-commit-sync-delay=# 
  The number of microseconds the server waits for the
  binary log group commit sync queue to fill before
@@ -1506,6 +1512,7 @@ binlog-encryption FALSE
 binlog-error-action ABORT_SERVER
 binlog-expire-logs-seconds 2592000
 binlog-format ROW
+binlog-group-commit-stats FALSE
 binlog-group-commit-sync-delay 0
 binlog-group-commit-sync-no-delay-count 0
 binlog-gtid-simple-recovery TRUE

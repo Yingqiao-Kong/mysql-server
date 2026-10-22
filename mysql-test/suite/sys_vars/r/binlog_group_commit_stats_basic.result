@@ -1,0 +1,21 @@
+# Default values
+SELECT @@GLOBAL.binlog_group_commit_stats;
+@@GLOBAL.binlog_group_commit_stats
+0
+SELECT @@SESSION.binlog_group_commit_stats;
+ERROR HY000: Variable 'binlog_group_commit_stats' is a GLOBAL variable
+# Valid values
+SET GLOBAL binlog_group_commit_stats = ON;
+SELECT @@GLOBAL.binlog_group_commit_stats;
+@@GLOBAL.binlog_group_commit_stats
+1
+SET GLOBAL binlog_group_commit_stats = OFF;
+SELECT @@GLOBAL.binlog_group_commit_stats;
+@@GLOBAL.binlog_group_commit_stats
+0
+# The statistics are shown by six global status variables
+SELECT COUNT(*) FROM performance_schema.global_status
+WHERE VARIABLE_NAME LIKE 'Binlog_group_commit%';
+COUNT(*)
+6
+SET GLOBAL binlog_group_commit_stats = @saved_value;
