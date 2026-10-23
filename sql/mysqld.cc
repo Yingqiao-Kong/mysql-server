@@ -11117,6 +11117,8 @@ PSI_mutex_key key_commit_order_manager_mutex;
 PSI_mutex_key key_mutex_slave_worker_hash;
 PSI_mutex_key key_monitor_info_run_lock;
 PSI_mutex_key key_mutex_binlog_flush_thread;
+PSI_mutex_key key_mutex_binlog_flush_done;
+PSI_mutex_key key_mutex_binlog_ha_flushed;
 
 /* clang-format off */
 static PSI_mutex_info all_server_mutexes[]=
@@ -11205,7 +11207,9 @@ static PSI_mutex_info all_server_mutexes[]=
   { &key_LOCK_admin_tls_ctx_options, "LOCK_admin_tls_ctx_options", 0, 0, "A lock to control all of the --ssl-* CTX related command line options for administrative connection port"},
   { &key_LOCK_rotate_binlog_master_key, "LOCK_rotate_binlog_master_key", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
   { &key_monitor_info_run_lock, "Source_IO_monitor::run_lock", 0, 0, PSI_DOCUMENT_ME},
-  { &key_mutex_binlog_flush_thread, "mutex_binlog_flush_thread", 0, 0, PSI_DOCUMENT_ME}
+  { &key_mutex_binlog_flush_thread, "mutex_binlog_flush_thread", 0, 0, PSI_DOCUMENT_ME},
+  { &key_mutex_binlog_flush_done, "mutex_binlog_flush_done", 0, 0, PSI_DOCUMENT_ME},
+  { &key_mutex_binlog_ha_flushed, "mutex_binlog_ha_flushed", 0, 0, PSI_DOCUMENT_ME}
 };
 /* clang-format on */
 
@@ -11278,6 +11282,8 @@ PSI_cond_key key_commit_order_manager_cond;
 PSI_cond_key key_cond_slave_worker_hash;
 PSI_cond_key key_monitor_info_run_cond;
 PSI_cond_key key_cond_binlog_flush_thread;
+PSI_cond_key key_cond_binlog_flush_done;
+PSI_cond_key key_cond_binlog_ha_flushed;
 
 /* clang-format off */
 static PSI_cond_info all_server_conds[]=
@@ -11321,7 +11327,9 @@ static PSI_cond_info all_server_conds[]=
   { &key_commit_order_manager_cond, "Commit_order_manager::m_workers.cond", 0, 0, PSI_DOCUMENT_ME},
   { &key_cond_slave_worker_hash, "Relay_log_info::slave_worker_hash_lock", 0, 0, PSI_DOCUMENT_ME},
   { &key_monitor_info_run_cond, "Source_IO_monitor::run_cond", 0, 0, PSI_DOCUMENT_ME},
-  { &key_cond_binlog_flush_thread, "cond_binlog_flush_thread", 0, 0, PSI_DOCUMENT_ME}
+  { &key_cond_binlog_flush_thread, "cond_binlog_flush_thread", 0, 0, PSI_DOCUMENT_ME},
+  { &key_cond_binlog_flush_done, "cond_binlog_flush_done", 0, 0, PSI_DOCUMENT_ME},
+  { &key_cond_binlog_ha_flushed, "cond_binlog_ha_flushed", 0, 0, PSI_DOCUMENT_ME}
 };
 /* clang-format on */
 

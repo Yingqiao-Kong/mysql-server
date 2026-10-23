@@ -444,6 +444,8 @@ extern PSI_mutex_key key_mts_gaq_LOCK;
 extern PSI_mutex_key key_thd_timer_mutex;
 extern PSI_mutex_key key_monitor_info_run_lock;
 extern PSI_mutex_key key_mutex_binlog_flush_thread;
+extern PSI_mutex_key key_mutex_binlog_flush_done;
+extern PSI_mutex_key key_mutex_binlog_ha_flushed;
 
 extern PSI_mutex_key key_commit_order_manager_mutex;
 extern PSI_mutex_key key_mutex_slave_worker_hash;
@@ -483,6 +485,8 @@ extern PSI_cond_key key_COND_commit_order;
 extern PSI_cond_key key_cond_slave_worker_hash;
 extern PSI_cond_key key_commit_order_manager_cond;
 extern PSI_cond_key key_cond_binlog_flush_thread;
+extern PSI_cond_key key_cond_binlog_flush_done;
+extern PSI_cond_key key_cond_binlog_ha_flushed;
 extern PSI_thread_key key_thread_bootstrap;
 extern PSI_thread_key key_thread_handle_manager;
 extern PSI_thread_key key_thread_one_connection;

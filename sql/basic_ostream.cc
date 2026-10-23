@@ -41,7 +41,7 @@ bool IO_CACHE_ostream::open(
                               MYF(MY_WME))) < 0)
     return true;
 
-  if (init_io_cache(&m_io_cache, file, IO_SIZE * 4, WRITE_CACHE, 0, false, flags)) {
+  if (init_io_cache(&m_io_cache, file, IO_SIZE * 8, WRITE_CACHE, 0, false, flags)) {
     mysql_file_close(file, MYF(0));
     return true;
   }

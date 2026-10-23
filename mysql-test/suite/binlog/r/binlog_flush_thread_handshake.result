@@ -1,0 +1,191 @@
+RESET MASTER;
+CREATE TABLE t1 (id INT PRIMARY KEY AUTO_INCREMENT, pad LONGBLOB) ENGINE=InnoDB;
+#
+# Scenario 1: the header thread publishes ha_flushed before the flush
+# thread announces itself. The flush thread must see the published flag
+# when it announces itself and must not block.
+#
+# The flush thread is parked before it takes the lock, i.e. before it can
+# be seen by the header thread, and the header thread only needs to run
+# ha_flush_logs() to publish the flag. Waiting here, instead of resuming
+# the flush thread immediately, lets the header thread get there first by
+# a margin of many orders of magnitude, so that this ordering and not the
+# opposite one is the one exercised. If ha_flush_logs() were so slow that
+# it did not make it in time, the flush thread would find the flag unset
+# and block, i.e. the run would degenerate into scenario 3 instead of
+# failing.
+#
+SET DEBUG_SYNC='binlog_ha_flushed_before_lock SIGNAL worker_before_lock WAIT_FOR resume_before_lock TIMEOUT 60';
+BEGIN;
+INSERT INTO t1 (pad) VALUES (REPEAT('a', 100000));
+COMMIT;
+SET DEBUG_SYNC='now WAIT_FOR worker_before_lock TIMEOUT 60';
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET DEBUG_SYNC='now SIGNAL resume_before_lock';
+#
+# Scenario 2: the flush thread has announced itself, but has not checked
+# the flag yet, when the header thread publishes it. The header thread
+# finds the announcement and blocks on m_ha_flushed_lock, which the flush
+# thread holds while it is parked. The flush thread then sees the flag
+# set, cancels its announcement and releases the lock, and the header
+# thread finds nobody left to wake. Neither side may block forever.
+#
+# The publication is delayed, as in scenario 3, so that the flush thread
+# has announced itself before the header thread publishes. Without the
+# delay the header thread would normally publish before the flush thread
+# announces itself, and the run would degenerate into scenario 1 instead
+# of failing.
+#
+SET SESSION debug='+d,binlog_flush_delay_ha_flushed_publish';
+SET DEBUG_SYNC='RESET';
+SET DEBUG_SYNC='binlog_ha_flushed_after_announce SIGNAL worker_after_announce WAIT_FOR resume_after_announce TIMEOUT 60';
+BEGIN;
+INSERT INTO t1 (pad) VALUES (REPEAT('b', 100000));
+COMMIT;
+SET DEBUG_SYNC='now WAIT_FOR worker_after_announce TIMEOUT 60';
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET DEBUG_SYNC='now SIGNAL resume_after_announce';
+SET SESSION debug='-d,binlog_flush_delay_ha_flushed_publish';
+#
+# Scenario 3: the flush thread announces itself and finds ha_flushed
+# unset. The header thread publishes the flag, sees the announcement and
+# blocks on m_ha_flushed_lock, which the flush thread holds. The flush
+# thread must then block on the condition variable, release the lock, and
+# be woken up by the broadcast of the header thread.
+#
+# Whether the flush thread gets to check the flag before the header thread
+# publishes it depends on how long ha_flush_logs() takes compared to the
+# writing of one IO cache worth of events, so the publication is delayed
+# with a debug flag to make the flush thread reach the check first. The
+# sleep below then lets the header thread publish and block on the lock,
+# which the flush thread holds while it is parked at the sync point.
+#
+SET SESSION debug='+d,binlog_flush_delay_ha_flushed_publish';
+SET DEBUG_SYNC='RESET';
+SET DEBUG_SYNC='binlog_ha_flushed_before_cond_wait SIGNAL worker_before_cond_wait WAIT_FOR resume_cond_wait TIMEOUT 60';
+BEGIN;
+INSERT INTO t1 (pad) VALUES (REPEAT('c', 100000));
+COMMIT;
+SET DEBUG_SYNC='now WAIT_FOR worker_before_cond_wait TIMEOUT 60';
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET DEBUG_SYNC='now SIGNAL resume_cond_wait';
+SET SESSION debug='-d,binlog_flush_delay_ha_flushed_publish';
+#
+# Scenario 4: the window of scenario 3 over several consecutive groups.
+# The header thread clears is_ha_flushed before handing the next group
+# over, so the flush thread must announce and block again for every
+# group; a missing clear would make the flush thread skip the wait and
+# the WAIT_FOR below time out.
+#
+SET SESSION debug='+d,binlog_flush_delay_ha_flushed_publish';
+SET DEBUG_SYNC='RESET';
+SET DEBUG_SYNC='binlog_ha_flushed_before_cond_wait SIGNAL worker_before_cond_wait WAIT_FOR resume_cond_wait TIMEOUT 60';
+BEGIN;
+INSERT INTO t1 (pad) VALUES (REPEAT('d', 100000));
+COMMIT;
+SET DEBUG_SYNC='now WAIT_FOR worker_before_cond_wait TIMEOUT 60';
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET DEBUG_SYNC='now SIGNAL resume_cond_wait';
+SET SESSION debug='-d,binlog_flush_delay_ha_flushed_publish';
+SET SESSION debug='+d,binlog_flush_delay_ha_flushed_publish';
+SET DEBUG_SYNC='RESET';
+SET DEBUG_SYNC='binlog_ha_flushed_before_cond_wait SIGNAL worker_before_cond_wait WAIT_FOR resume_cond_wait TIMEOUT 60';
+BEGIN;
+INSERT INTO t1 (pad) VALUES (REPEAT('d', 100000));
+COMMIT;
+SET DEBUG_SYNC='now WAIT_FOR worker_before_cond_wait TIMEOUT 60';
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET DEBUG_SYNC='now SIGNAL resume_cond_wait';
+SET SESSION debug='-d,binlog_flush_delay_ha_flushed_publish';
+SET SESSION debug='+d,binlog_flush_delay_ha_flushed_publish';
+SET DEBUG_SYNC='RESET';
+SET DEBUG_SYNC='binlog_ha_flushed_before_cond_wait SIGNAL worker_before_cond_wait WAIT_FOR resume_cond_wait TIMEOUT 60';
+BEGIN;
+INSERT INTO t1 (pad) VALUES (REPEAT('d', 100000));
+COMMIT;
+SET DEBUG_SYNC='now WAIT_FOR worker_before_cond_wait TIMEOUT 60';
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET DEBUG_SYNC='now SIGNAL resume_cond_wait';
+SET SESSION debug='-d,binlog_flush_delay_ha_flushed_publish';
+SET SESSION debug='+d,binlog_flush_delay_ha_flushed_publish';
+SET DEBUG_SYNC='RESET';
+SET DEBUG_SYNC='binlog_ha_flushed_before_cond_wait SIGNAL worker_before_cond_wait WAIT_FOR resume_cond_wait TIMEOUT 60';
+BEGIN;
+INSERT INTO t1 (pad) VALUES (REPEAT('d', 100000));
+COMMIT;
+SET DEBUG_SYNC='now WAIT_FOR worker_before_cond_wait TIMEOUT 60';
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET DEBUG_SYNC='now SIGNAL resume_cond_wait';
+SET SESSION debug='-d,binlog_flush_delay_ha_flushed_publish';
+SET SESSION debug='+d,binlog_flush_delay_ha_flushed_publish';
+SET DEBUG_SYNC='RESET';
+SET DEBUG_SYNC='binlog_ha_flushed_before_cond_wait SIGNAL worker_before_cond_wait WAIT_FOR resume_cond_wait TIMEOUT 60';
+BEGIN;
+INSERT INTO t1 (pad) VALUES (REPEAT('d', 100000));
+COMMIT;
+SET DEBUG_SYNC='now WAIT_FOR worker_before_cond_wait TIMEOUT 60';
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET DEBUG_SYNC='now SIGNAL resume_cond_wait';
+SET SESSION debug='-d,binlog_flush_delay_ha_flushed_publish';
+#
+# Scenario 5: concurrent commits, without synchronization points, so that
+# groups of more than one transaction and arbitrary interleavings of the
+# header and the flush thread are exercised.
+#
+INSERT INTO t1 (pad) VALUES (REPEAT('e', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('f', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('g', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('e', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('f', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('g', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('e', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('f', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('g', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('e', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('f', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('g', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('e', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('f', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('g', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('e', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('f', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('g', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('e', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('f', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('g', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('e', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('f', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('g', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('e', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('f', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('g', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('e', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('f', 100000));
+INSERT INTO t1 (pad) VALUES (REPEAT('g', 100000));
+include/assert.inc [All transactions were committed]
+SELECT COUNT(*), SUM(LENGTH(pad)) FROM t1;
+COUNT(*)	SUM(LENGTH(pad))
+38	3800000
+FLUSH LOGS;
+# Transactions found in the binary log:
+38
+SET DEBUG_SYNC='RESET';
+SET DEBUG_SYNC='RESET';
+SET DEBUG_SYNC='RESET';
+DROP TABLE t1;

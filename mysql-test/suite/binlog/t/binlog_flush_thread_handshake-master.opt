@@ -1,0 +1,1 @@
+--binlog-format=ROW --ordered-commit-flush-binlog-in-advance=ON --sync-binlog=1 --innodb-flush-log-at-trx-commit=1

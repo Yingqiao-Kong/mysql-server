@@ -1,0 +1,313 @@
+# ==== Purpose ====
+#
+# Test the hand shake between the flush stage header thread and the dedicated
+# binlog flush thread of the parallel binlog flush feature
+# (ordered_commit_flush_binlog_in_advance).
+#
+# The binlog flush thread is not allowed to write binlog into the IO cache
+# beyond the point covered by the storage engines' logs already flushed to
+# disk. When the IO cache of the binlog file has no room left for the next
+# event, it calls MYSQL_BIN_LOG::suspend_till_ha_flushed(), announces itself,
+# and blocks on m_ha_flushed_cond until the header thread has run
+# ha_flush_logs() and published that fact with set_ha_flushed_status(true).
+#
+# The announcement and the flag are plain seq_cst atomics, not lock protected
+# (the lock only keeps the wakeup from being broadcast before the waiter has
+# blocked), so the interesting part of the protocol is the interleaving of the
+# two threads. This test reproduces each window deterministically with
+# DEBUG_SYNC points placed in suspend_till_ha_flushed():
+#
+#   binlog_ha_flushed_before_lock        before the worker takes the lock
+#   binlog_ha_flushed_after_announce     announced, not yet checked the flag
+#   binlog_ha_flushed_before_cond_wait   flag seen false, about to block
+#
+# and checks that no interleaving loses the wakeup or deadlocks. A lost wakeup
+# shows up as a hanging COMMIT, i.e. a test timeout, because the flush stage
+# header thread would wait forever on cond_flush_done.
+#
+# The publication of the flag is delayed by the debug flag
+# binlog_flush_delay_ha_flushed_publish where the test needs the flush thread
+# to check the flag before the header thread sets it; otherwise the ordering of
+# the two threads depends on how long ha_flush_logs() takes compared to writing
+# one IO cache worth of events.
+#
+# What this test checks of the memory ordering: the pairing of the two
+# accesses is a store-buffer (Dekker) pattern. On the header side the flag is
+# stored and the announcement is loaded; on the flush thread side the
+# announcement is stored and the flag is loaded. x86 (TSO) keeps stores in
+# order and keeps loads in order, but it does reorder a store with a later
+# load, so either side can have its store delayed past its own load and both
+# sides can then read the other's store as unset. Scenario 3 parks the flush
+# thread right after a load that saw the flag unset, so the header side pair
+# runs while it is parked, which is why a weakened order of these accesses can
+# lose the wakeup here and not only on ARM. Scenario 2 is not an ordering
+# check of this kind: the sleep there is long enough for the stores to drain
+# before the flush thread loads the flag, so what it covers is the lock
+# ordering around m_ha_flushed_lock. The ordering itself remains a race that
+# the hardware has to lose; the deterministic check of it is left to code
+# review of the four accesses in set_ha_flushed_status() /
+# suspend_till_ha_flushed(), which must all be seq_cst.
+#
+# A transaction triggers the hand shake when the events it writes are larger
+# than the IO cache of the binlog file (IO_SIZE * 8 = 32KiB). With
+# binlog_format=ROW, the row events of a 100000 bytes blob are written to the
+# file in the flush stage and cross that boundary, so every transaction below
+# suspends at least once.
+#
+# ==== Implementation ====
+#
+# The DEBUG_SYNC points are hit by the binlog flush thread, but with the THD of
+# the flush stage header thread as current_thd (binlog_flush() runs with that
+# THD, see Thd_backup_and_restore). The actions are therefore installed by con1
+# -- the session whose COMMIT becomes the leader of the flush stage -- and the
+# signals are sent from a second connection, con2.
+#
+# Do not park the header thread itself: it would share one debug_sync_control
+# with the flush thread, which hits its points with the header thread's THD.
+# Concurrent debug_sync() calls would race on its hit counter, and
+# debug_sync_remove_action() would move the action array while the parked
+# thread still points into it. That is why the header thread side is delayed by
+# a debug flag (binlog_flush_delay_ha_flushed_publish) rather than parked on a
+# synchronization point of its own.
+#
+# Each scenario waits for its result on both sides: con2 asserts that the
+# flush thread reached the expected synchronization point (a warning is what a
+# timeout on that wait produces), and con1 asserts after the reap that its
+# COMMIT produced no warnings, which is what a timeout of the flush thread's
+# own wait would leave behind.
+#
+# ==== Coverage ====
+#
+#   scenario 1  the header thread publishes before the flush thread announces
+#   scenario 2  the flush thread has announced, but not checked the flag yet,
+#               when the header thread publishes and finds it
+#   scenario 3  the flush thread has checked the flag when the header thread
+#               publishes, so it blocks and must be woken up by a broadcast
+#   scenario 4  the window of scenario 3 over several consecutive groups
+#   scenario 5  concurrent commits, no synchronization points
+#
+# ==== References ====
+#
+# The hand shake is set_ha_flushed_status() / suspend_till_ha_flushed() in
+# sql/binlog.h.
+
+--source include/have_log_bin.inc
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+
+--let $oc_flush_in_advance= `SELECT @@GLOBAL.ordered_commit_flush_binlog_in_advance`
+if (`SELECT $oc_flush_in_advance = 0`)
+{
+  --skip Test requires ordered_commit_flush_binlog_in_advance (Hygon CPU)
+}
+
+--let $payload_size= 100000
+
+# Seconds to wait before letting the flush thread continue, so that the header
+# thread has published the flag in the meantime. Must exceed the delay of the
+# binlog_flush_delay_ha_flushed_publish debug point (0.5 seconds, see
+# fetch_and_process_flush_stage_queue() in sql/binlog.cc) for the scenarios
+# which use it, or else the header thread is still sleeping when the signal
+# below arrives and the interleaving that gets exercised is a different one
+# (the test does not fail in that case, it just covers less).
+--let $publish_wait= 1
+
+# Seconds to wait for a synchronization point to be hit.
+--let $sync_timeout= 60
+
+RESET MASTER;
+CREATE TABLE t1 (id INT PRIMARY KEY AUTO_INCREMENT, pad LONGBLOB) ENGINE=InnoDB;
+
+connect (con1, localhost, root,,);
+connect (con2, localhost, root,,);
+connect (con3, localhost, root,,);
+
+--echo #
+--echo # Scenario 1: the header thread publishes ha_flushed before the flush
+--echo # thread announces itself. The flush thread must see the published flag
+--echo # when it announces itself and must not block.
+--echo #
+--echo # The flush thread is parked before it takes the lock, i.e. before it can
+--echo # be seen by the header thread, and the header thread only needs to run
+--echo # ha_flush_logs() to publish the flag. Waiting here, instead of resuming
+--echo # the flush thread immediately, lets the header thread get there first by
+--echo # a margin of many orders of magnitude, so that this ordering and not the
+--echo # opposite one is the one exercised. If ha_flush_logs() were so slow that
+--echo # it did not make it in time, the flush thread would find the flag unset
+--echo # and block, i.e. the run would degenerate into scenario 3 instead of
+--echo # failing.
+--echo #
+--connection con1
+--eval SET DEBUG_SYNC='binlog_ha_flushed_before_lock SIGNAL worker_before_lock WAIT_FOR resume_before_lock TIMEOUT $sync_timeout'
+BEGIN;
+--eval INSERT INTO t1 (pad) VALUES (REPEAT('a', $payload_size))
+--send COMMIT
+
+--connection con2
+--eval SET DEBUG_SYNC='now WAIT_FOR worker_before_lock TIMEOUT $sync_timeout'
+--source include/assert_no_warnings.inc
+--eval SELECT SLEEP($publish_wait)
+SET DEBUG_SYNC='now SIGNAL resume_before_lock';
+
+--connection con1
+--reap
+--source include/assert_no_warnings.inc
+
+--echo #
+--echo # Scenario 2: the flush thread has announced itself, but has not checked
+--echo # the flag yet, when the header thread publishes it. The header thread
+--echo # finds the announcement and blocks on m_ha_flushed_lock, which the flush
+--echo # thread holds while it is parked. The flush thread then sees the flag
+--echo # set, cancels its announcement and releases the lock, and the header
+--echo # thread finds nobody left to wake. Neither side may block forever.
+--echo #
+--echo # The publication is delayed, as in scenario 3, so that the flush thread
+--echo # has announced itself before the header thread publishes. Without the
+--echo # delay the header thread would normally publish before the flush thread
+--echo # announces itself, and the run would degenerate into scenario 1 instead
+--echo # of failing.
+--echo #
+--connection con1
+SET SESSION debug='+d,binlog_flush_delay_ha_flushed_publish';
+SET DEBUG_SYNC='RESET';
+--eval SET DEBUG_SYNC='binlog_ha_flushed_after_announce SIGNAL worker_after_announce WAIT_FOR resume_after_announce TIMEOUT $sync_timeout'
+BEGIN;
+--eval INSERT INTO t1 (pad) VALUES (REPEAT('b', $payload_size))
+--send COMMIT
+
+--connection con2
+--eval SET DEBUG_SYNC='now WAIT_FOR worker_after_announce TIMEOUT $sync_timeout'
+--source include/assert_no_warnings.inc
+--eval SELECT SLEEP($publish_wait)
+SET DEBUG_SYNC='now SIGNAL resume_after_announce';
+
+--connection con1
+--reap
+--source include/assert_no_warnings.inc
+SET SESSION debug='-d,binlog_flush_delay_ha_flushed_publish';
+
+--echo #
+--echo # Scenario 3: the flush thread announces itself and finds ha_flushed
+--echo # unset. The header thread publishes the flag, sees the announcement and
+--echo # blocks on m_ha_flushed_lock, which the flush thread holds. The flush
+--echo # thread must then block on the condition variable, release the lock, and
+--echo # be woken up by the broadcast of the header thread.
+--echo #
+--echo # Whether the flush thread gets to check the flag before the header thread
+--echo # publishes it depends on how long ha_flush_logs() takes compared to the
+--echo # writing of one IO cache worth of events, so the publication is delayed
+--echo # with a debug flag to make the flush thread reach the check first. The
+--echo # sleep below then lets the header thread publish and block on the lock,
+--echo # which the flush thread holds while it is parked at the sync point.
+--echo #
+--connection con1
+SET SESSION debug='+d,binlog_flush_delay_ha_flushed_publish';
+SET DEBUG_SYNC='RESET';
+--eval SET DEBUG_SYNC='binlog_ha_flushed_before_cond_wait SIGNAL worker_before_cond_wait WAIT_FOR resume_cond_wait TIMEOUT $sync_timeout'
+BEGIN;
+--eval INSERT INTO t1 (pad) VALUES (REPEAT('c', $payload_size))
+--send COMMIT
+
+--connection con2
+--eval SET DEBUG_SYNC='now WAIT_FOR worker_before_cond_wait TIMEOUT $sync_timeout'
+--source include/assert_no_warnings.inc
+--eval SELECT SLEEP($publish_wait)
+SET DEBUG_SYNC='now SIGNAL resume_cond_wait';
+
+--connection con1
+--reap
+--source include/assert_no_warnings.inc
+SET SESSION debug='-d,binlog_flush_delay_ha_flushed_publish';
+
+--echo #
+--echo # Scenario 4: the window of scenario 3 over several consecutive groups.
+--echo # The header thread clears is_ha_flushed before handing the next group
+--echo # over, so the flush thread must announce and block again for every
+--echo # group; a missing clear would make the flush thread skip the wait and
+--echo # the WAIT_FOR below time out.
+--echo #
+--let $iteration= 1
+while ($iteration <= 5)
+{
+  --connection con1
+  SET SESSION debug='+d,binlog_flush_delay_ha_flushed_publish';
+  SET DEBUG_SYNC='RESET';
+  --eval SET DEBUG_SYNC='binlog_ha_flushed_before_cond_wait SIGNAL worker_before_cond_wait WAIT_FOR resume_cond_wait TIMEOUT $sync_timeout'
+  BEGIN;
+  --eval INSERT INTO t1 (pad) VALUES (REPEAT('d', $payload_size))
+  --send COMMIT
+
+  --connection con2
+  --eval SET DEBUG_SYNC='now WAIT_FOR worker_before_cond_wait TIMEOUT $sync_timeout'
+  --source include/assert_no_warnings.inc
+  --eval SELECT SLEEP($publish_wait)
+  SET DEBUG_SYNC='now SIGNAL resume_cond_wait';
+
+  --connection con1
+  --reap
+  --source include/assert_no_warnings.inc
+  SET SESSION debug='-d,binlog_flush_delay_ha_flushed_publish';
+  --inc $iteration
+}
+
+--echo #
+--echo # Scenario 5: concurrent commits, without synchronization points, so that
+--echo # groups of more than one transaction and arbitrary interleavings of the
+--echo # header and the flush thread are exercised.
+--echo #
+--let $iteration= 1
+while ($iteration <= 10)
+{
+  --connection con1
+  --send_eval INSERT INTO t1 (pad) VALUES (REPEAT('e', $payload_size))
+  --connection con2
+  --send_eval INSERT INTO t1 (pad) VALUES (REPEAT('f', $payload_size))
+  --connection con3
+  --send_eval INSERT INTO t1 (pad) VALUES (REPEAT('g', $payload_size))
+  --connection con1
+  --reap
+  --connection con2
+  --reap
+  --connection con3
+  --reap
+  --inc $iteration
+}
+
+--connection default
+
+--let $count= `SELECT COUNT(*) FROM t1`
+--let $total_size= `SELECT SUM(LENGTH(pad)) FROM t1`
+--let $expected_count= 38
+--let $expected_size= `SELECT 38 * $payload_size`
+--let $assert_text= All transactions were committed
+--let $assert_cond= $count = $expected_count AND $total_size = $expected_size
+--source include/assert.inc
+SELECT COUNT(*), SUM(LENGTH(pad)) FROM t1;
+
+# The rows above come from the storage engine. Read the binary log back as
+# well: the events the flush thread wrote while it was suspended must form a
+# valid event stream. mysqlbinlog verifies the checksum of every event and
+# returns a non-zero status if the stream does not parse, which fails the test.
+--let $binlog_file= query_get_value(SHOW MASTER STATUS, File, 1)
+--let $MYSQLD_DATADIR= `SELECT @@datadir`
+FLUSH LOGS;
+--exec $MYSQL_BINLOG --verify-binlog-checksum $MYSQLD_DATADIR/$binlog_file > $MYSQLTEST_VARDIR/tmp/binlog_flush_thread_handshake.sql
+# Every transaction must also be present in the binary log, not only in the
+# table: this counts the transactions the flush thread wrote and compares the
+# number with the one expected above through the result file.
+--echo # Transactions found in the binary log:
+--exec grep -c "^BEGIN" $MYSQLTEST_VARDIR/tmp/binlog_flush_thread_handshake.sql
+--remove_file $MYSQLTEST_VARDIR/tmp/binlog_flush_thread_handshake.sql
+
+--connection con1
+SET DEBUG_SYNC='RESET';
+--connection con2
+SET DEBUG_SYNC='RESET';
+--connection con3
+SET DEBUG_SYNC='RESET';
+
+--connection default
+disconnect con1;
+disconnect con2;
+disconnect con3;
+DROP TABLE t1;

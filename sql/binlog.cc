@@ -3620,6 +3620,13 @@ void MYSQL_BIN_LOG::cleanup() {
       terminate_all_binlog_threads();
     }
 
+    /*
+      Destroyed after the dedicated threads have been terminated: the binlog
+      flush thread may be blocked on m_ha_flushed_cond until it exits.
+    */
+    mysql_mutex_destroy(&m_ha_flushed_lock);
+    mysql_cond_destroy(&m_ha_flushed_cond);
+
     if (!is_relay_log) {
       Commit_stage_manager::get_instance().deinit();
     }
@@ -3662,6 +3669,9 @@ void MYSQL_BIN_LOG::init_pthread_objects() {
   mysql_mutex_init(m_key_LOCK_xids, &LOCK_xids, MY_MUTEX_INIT_FAST);
   mysql_cond_init(m_key_update_cond, &update_cond);
   mysql_cond_init(m_key_prep_xids_cond, &m_prep_xids_cond);
+  mysql_mutex_init(key_mutex_binlog_ha_flushed, &m_ha_flushed_lock,
+                   MY_MUTEX_INIT_FAST);
+  mysql_cond_init(key_cond_binlog_ha_flushed, &m_ha_flushed_cond);
 #ifdef HAVE_LIBNUMA
   binlog_get_available_cpu();
 #endif
@@ -3742,11 +3752,21 @@ void *MYSQL_BIN_LOG::binlog_flush_worker(void *arg)
 
       mysql_bin_log.binlog_flush(mngr);
       /*
-        Release: pairs with acquire load in process_flush_stage_queue so all
-        writes to flush_thread_caches_result in binlog_flush() are visible
-        before the leader reads them.
+        Hand the result of the request over: the flag and the writes to
+        flush_thread_caches_result done by binlog_flush() are published under
+        mutex_flush_done, which the wait in process_flush_stage_queue() takes
+        too, so that the flush stage header thread reads them consistently.
+        Then wake the header thread up, which blocks on cond_flush_done until
+        this request has been processed instead of spinning for the flag.
+
+        The hand over uses a lock of its own instead of mutex_flush_thread, so
+        that the flush stage header thread never has to take a mutex which this
+        thread holds for the whole duration of binlog_flush().
       */
-      mngr->flush_thread_caches_done.store(true, std::memory_order_release);
+      mysql_mutex_lock(&(mngr->mutex_flush_done));
+      mngr->flush_thread_caches_done = true;
+      mysql_cond_signal(&(mngr->cond_flush_done));
+      mysql_mutex_unlock(&(mngr->mutex_flush_done));
     }
 
     /*
@@ -3797,6 +3817,12 @@ void MYSQL_BIN_LOG::terminate_all_binlog_threads(void) {
     if (m_dedicated_thread_status & ORDERED_COMMIT_FLUSH_THREAD_STARTED) {
       mysql_mutex_lock(&(mngr->mutex_flush_thread));
       mngr->thread_exit = true;
+      /*
+        Signal, not broadcast: cond_flush_thread is waited on only by the flush
+        worker, which waits here for a new request or for the exit request. The
+        flush stage header thread waits for its request to be processed on
+        cond_flush_done instead.
+      */
       mysql_cond_signal(&(mngr->cond_flush_thread));
       mysql_mutex_unlock(&(mngr->mutex_flush_thread));
 
@@ -8618,6 +8644,10 @@ THD *MYSQL_BIN_LOG::fetch_and_process_flush_stage_queue(
         in m_binlog_file has no enough remaining space for wrting binlog events. And at this
         point, binlog flush thread must be sleeping, or something error happened if it's waked.
         So there is no need to add specific lock for updating status of handlertons's logs here.
+        The flag itself is atomic, and set_ha_flushed_status() takes m_ha_flushed_lock only to
+        wake the binlog flush thread up, which no lock is needed for here as no waiter can exist
+        while mutex_flush_thread is held: the flush thread holds it for the whole duration of a
+        request, including the wait it may be blocked in.
       */
       set_ha_flushed_status(false);
 #ifndef NDEBUG
@@ -8626,7 +8656,14 @@ THD *MYSQL_BIN_LOG::fetch_and_process_flush_stage_queue(
       flush_mngr->header_thd = current_thd;
       assert(flush_mngr->first_thd_in_group == nullptr);
       flush_mngr->first_thd_in_group = first_seen;
-      flush_mngr->flush_thread_caches_done.store(false);
+      /*
+        Clear the result of the previous request, so that it cannot be taken
+        for the result of this one should a request ever be published without
+        being consumed. No lock is needed: the result is published under
+        mutex_flush_done by the flush thread, which mutex_flush_thread, held
+        here, excludes for the whole duration of a request.
+      */
+      flush_mngr->flush_thread_caches_done = false;
 
       mysql_cond_signal(&(flush_mngr->cond_flush_thread));
     } else {
@@ -8649,7 +8686,13 @@ THD *MYSQL_BIN_LOG::fetch_and_process_flush_stage_queue(
     /*
       If binlog flush thread is waiting for handlertons's logs to be flushed, then it can acquire such status
       after the status is set to true by flush stage header thread here.
+
+      The publication is delayed for tests, which need the binlog flush thread
+      to reach suspend_till_ha_flushed() and check the flag before it is set.
+      The delay is half a second, so that a test which waits for this thread to
+      block on m_ha_flushed_lock has a comfortable margin on a loaded machine.
     */
+    DBUG_EXECUTE_IF("binlog_flush_delay_ha_flushed_publish", my_sleep(500000););
     set_ha_flushed_status(true);
   }
 
@@ -8679,22 +8722,37 @@ int MYSQL_BIN_LOG::process_flush_stage_queue(my_off_t *total_bytes_var,
   DBUG_EXECUTE_IF("crash_after_flush_engine_log", DBUG_SUICIDE(););
 
   if (check_if_flush_binlog_in_advance()) {
-    /* Check if flushing thread caches to binary log has been done. Wait until done! */
+    /*
+      The flush work of this group was handed over to the dedicated binlog
+      flush worker by fetch_and_process_flush_stage_queue(), which published
+      first_thd_in_group and woke the worker up. Block until the worker signals
+      that it has processed the request, instead of spinning for the flag: a
+      spinning header thread burns a whole CPU while the worker, whose progress
+      it waits for, has to compete for CPU time, so it may slow the very work
+      it is waiting for instead of shortening the wait.
+
+      Waiting is done on mutex_flush_done/cond_flush_done, which the worker
+      takes only to announce the result, and not on mutex_flush_thread, which
+      the worker holds for the whole duration of binlog_flush(). The worker
+      notifies under mutex_flush_done, so the flag and the result it protects
+      are read consistently here. The wait always ends: the request can only be
+      published while the worker is still running (the publishing thread holds
+      mutex_flush_thread, and the worker holds it while it exits), and the
+      worker never leaves its loop without processing a published request.
+    */
     ordered_commit_flush_thread *mngr = &(binlog_flush_thread_mngr);
-    while (!mngr->flush_thread_caches_done.load(std::memory_order_acquire)) {
-#if defined(__i386__) || defined(__x86_64__)
-      __asm__ __volatile__ ("pause" ::: "memory");
-#else
-      __asm__ __volatile__ ("" ::: "memory");
-#endif
+    mysql_mutex_lock(&(mngr->mutex_flush_done));
+    while (!mngr->flush_thread_caches_done) {
+      mysql_cond_wait(&(mngr->cond_flush_done), &(mngr->mutex_flush_done));
     }
-    mngr->flush_thread_caches_done.store(false, std::memory_order_relaxed);
+    mngr->flush_thread_caches_done = false;
 
     total_bytes = mngr->flush_thread_caches_result.total_bytes;
     flush_error = mngr->flush_thread_caches_result.flush_error;
 #ifndef NDEBUG
     no_flushes = mngr->flush_thread_caches_result.no_flushes;
 #endif
+    mysql_mutex_unlock(&(mngr->mutex_flush_done));
   } else {
     assign_automatic_gtids_to_flush_group(first_seen);
     /* Flush thread caches to binary log. */

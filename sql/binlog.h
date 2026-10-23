@@ -45,6 +45,8 @@
 #include "mysql/psi/mysql_mutex.h"
 #include "mysql/udf_registration_types.h"
 #include "mysql_com.h"  // Item_result
+#include "sql/current_thd.h"
+#include "sql/debug_sync.h"
 #include "sql/mysqld.h"
 #include "sql/rpl_commit_stage_manager.h"
 #include "sql/rpl_trx_tracking.h"
@@ -921,25 +923,112 @@ public:
   void terminate_all_binlog_threads(void);
 
   /**
-    Set the status of flushing storage engines' logs. 
+    Set the status of flushing storage engines' logs.
     @param status True if all storage engines' logs have been flushed, False otherwise.
   */
   inline void set_ha_flushed_status(bool status) {
-    is_ha_flushed.store(status, std::memory_order_release);
+    /*
+      Clearing the flag needs neither the lock nor a wakeup: it is done by a
+      flush stage header thread before handing its request over, and the
+      mutex_flush_thread held there is held by the binlog flush thread for the
+      whole duration of a request, so the flush thread cannot be blocked in
+      suspend_till_ha_flushed() at this point. The flag is atomic, and the hand
+      over orders this store before the flush thread reads the flag.
+    */
+    if (!status) {
+      is_ha_flushed.store(false, std::memory_order_release);
+      return;
+    }
+
+    /*
+      Publish the flag first and check afterwards whether the flush thread is
+      blocked. Both accesses are seq_cst, as are the store of
+      m_ha_flushed_waiter and the load of the flag in
+      suspend_till_ha_flushed(): that is the usual Dekker hand shake and
+      guarantees that at least one side sees the other, so that a flush thread
+      which checked the flag just before it is set either finds it set or is
+      seen as a waiter below, instead of blocking until the next group.
+
+      The lock is taken only when there is a waiter to wake, which is the
+      exception: the flag is set for every group, while the flush thread
+      reaches that wait only when its IO cache runs out of room. Taking it
+      keeps the wakeup from being broadcast before a waiter which has just
+      announced itself has actually blocked in mysql_cond_wait(). Broadcast
+      rather than signal: only the binlog flush thread enters this wait, but a
+      second one would already be woken by a broadcast (m_ha_flushed_waiter
+      would have to become a counter, though).
+    */
+    is_ha_flushed.store(true, std::memory_order_seq_cst);
+    if (m_ha_flushed_waiter.load(std::memory_order_seq_cst)) {
+      mysql_mutex_lock(&m_ha_flushed_lock);
+      mysql_cond_broadcast(&m_ha_flushed_cond);
+      mysql_mutex_unlock(&m_ha_flushed_lock);
+    }
   }
 
   /*
     Suspend until storage engines' logs to be flushed.
+
+    The binlog flush thread is not allowed to write binlog beyond the point
+    which is covered by the storage engines' logs already flushed to disk. When
+    the IO cache has no room left for the next event, it blocks here until the
+    flush stage header thread has flushed the storage engines' logs
+    (ha_flush_logs()) and published that fact through set_ha_flushed_status(true).
+
+    Blocking on a condition variable, instead of busy-waiting on the flag with
+    a pause instruction, keeps the waiting thread off the CPU for as long as
+    the flag has not been published: a busy-waiting flush thread burns a whole
+    CPU and competes with the header thread, on which the progress of this very
+    wait depends, for the CPU it needs to run.
+
+    A wakeup cannot be lost. m_ha_flushed_waiter is set, with a seq_cst store,
+    before the flag is checked, and kept set for the whole wait;
+    set_ha_flushed_status() publishes the flag, also with a seq_cst store,
+    before it loads that announcement. At least one of the two therefore sees
+    the other: a header thread which publishes the flag after this thread has
+    announced itself finds a waiter to wake, and one which publishes before the
+    check below is done leaves a flag that the check sees. The lock is held
+    from the announcement until mysql_cond_wait() releases it, so the wakeup
+    cannot be broadcast before this thread has actually blocked.
+
+    The wait always ends: this function is only reached by the binlog flush
+    thread while it processes a request published by a flush stage header
+    thread, and that header thread always reaches set_ha_flushed_status(true)
+    after ha_flush_logs() -- there is no early return, timeout or kill point
+    between publishing the request and setting the flag. A future change which
+    introduces one must wake this wait up explicitly, or a flush thread parked
+    here would keep terminate_all_binlog_threads() (my_thread_join()) waiting
+    forever.
+
     @note This function is called by binlog flush thread to wait for the storage engines' logs to be flushed.
   */
   void suspend_till_ha_flushed(void) {
-    while (!is_ha_flushed.load(std::memory_order_acquire)) {
-#if defined(__i386__) || defined(__x86_64__)
-      __asm__ __volatile__ ("pause" ::: "memory");
-#else
-      __asm__ __volatile__ ("" ::: "memory");
-#endif
+    /*
+      The synchronization points below are hit by the binlog flush thread, with
+      the THD of the flush stage header thread as current_thd, which is why the
+      action installed by a test belongs to that session. They let a test park
+      this thread in each window of the handshake -- before taking the lock,
+      after announcing itself but before checking the flag (holding the lock),
+      and before blocking on the condition variable -- so that the interleaving
+      with set_ha_flushed_status() can be reproduced deterministically instead
+      of waited for.
+    */
+    DEBUG_SYNC(current_thd, "binlog_ha_flushed_before_lock");
+    mysql_mutex_lock(&m_ha_flushed_lock);
+    /*
+      Announce the wait before checking the flag, and keep the announcement
+      until the flag has been seen, so that set_ha_flushed_status() knows
+      whether there is a thread to wake. It reads the announcement without the
+      lock, the seq_cst accesses pairing with its own, see above.
+    */
+    m_ha_flushed_waiter.store(true, std::memory_order_seq_cst);
+    DEBUG_SYNC(current_thd, "binlog_ha_flushed_after_announce");
+    while (!is_ha_flushed.load(std::memory_order_seq_cst)) {
+      DEBUG_SYNC(current_thd, "binlog_ha_flushed_before_cond_wait");
+      mysql_cond_wait(&m_ha_flushed_cond, &m_ha_flushed_lock);
     }
+    m_ha_flushed_waiter.store(false, std::memory_order_seq_cst);
+    mysql_mutex_unlock(&m_ha_flushed_lock);
   }
 
   /**
@@ -959,6 +1048,25 @@ private:
     std::atomic<bool> is_ha_flushed{false};
 
     /*
+      Wakeup channel of suspend_till_ha_flushed(): the flag is published by the
+      flush stage header thread (set_ha_flushed_status()) and waited for by the
+      binlog flush thread. The lock does not guard is_ha_flushed -- it is
+      atomic, and the clearing store is done without the lock -- but keeps the
+      wakeup from being broadcast before the waiter has released it to
+      mysql_cond_wait().
+    */
+    mysql_mutex_t m_ha_flushed_lock;
+    mysql_cond_t m_ha_flushed_cond;
+
+    /*
+      True while the binlog flush thread is blocked in
+      suspend_till_ha_flushed(). Written by that thread under m_ha_flushed_lock
+      and read without it by set_ha_flushed_status(), the seq_cst accesses
+      pairing with those of the latter.
+    */
+    std::atomic<bool> m_ha_flushed_waiter{false};
+
+    /*
       Time sequence of flushing binlog when enable dedicated threads to flush binlog to disk:
       flush stage leader: ------------flush engines' logs---(wait)----------------------
                                     |                                ^
@@ -971,6 +1079,15 @@ private:
     my_thread_handle thread_id;  /* This is the thread flushing binlog. */
     mysql_mutex_t mutex_flush_thread;
     mysql_cond_t cond_flush_thread;
+
+    /*
+      Hand over of the result of a flush request, kept apart from
+      mutex_flush_thread: the flush stage header thread waits here for the
+      flush thread to process its request, while the flush thread holds
+      mutex_flush_thread for the whole duration of binlog_flush().
+    */
+    mysql_mutex_t mutex_flush_done;
+    mysql_cond_t cond_flush_done;
 
 #ifndef NDEBUG
     struct CODE_STATE *cs_header_thread;
@@ -989,8 +1106,11 @@ private:
     /*
       Initialize as false. When binlog flush thread finishes flushing binlog, set it as true.
       Then, ordered commit flush stage header thread acquires result of flushing binlog and sets it as false again.
+      Protected by mutex_flush_done, together with flush_thread_caches_result below.
+      It is also cleared when a request is handed over, under mutex_flush_thread
+      instead, so that a result cannot outlive the request it belongs to.
      */
-    std::atomic<bool> flush_thread_caches_done;
+    bool flush_thread_caches_done;
 
     /* Result of flushing binlog done by binlog flush thread. */
     struct flush_binlog_result {
@@ -1010,10 +1130,12 @@ private:
       header_thd = nullptr;
       first_thd_in_group = nullptr;
       thread_exit = false;
-      flush_thread_caches_done.store(false);
+      flush_thread_caches_done = false;
 
       mysql_mutex_init(key_mutex_binlog_flush_thread, &mutex_flush_thread, MY_MUTEX_INIT_FAST);
       mysql_cond_init(key_cond_binlog_flush_thread, &cond_flush_thread);
+      mysql_mutex_init(key_mutex_binlog_flush_done, &mutex_flush_done, MY_MUTEX_INIT_FAST);
+      mysql_cond_init(key_cond_binlog_flush_done, &cond_flush_done);
     }
 
     void deinit(void) {
@@ -1021,6 +1143,8 @@ private:
       first_thd_in_group = nullptr;
       mysql_mutex_destroy(&mutex_flush_thread);
       mysql_cond_destroy(&cond_flush_thread);
+      mysql_mutex_destroy(&mutex_flush_done);
+      mysql_cond_destroy(&cond_flush_done);
     }
   };
 
