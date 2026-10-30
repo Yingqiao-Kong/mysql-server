@@ -295,8 +295,14 @@ FLUSH LOGS;
 # Every transaction must also be present in the binary log, not only in the
 # table: this counts the transactions the flush thread wrote and compares the
 # number with the one expected above through the result file.
+#
+# The exit status of the command is ignored on purpose: under --sanitize every
+# child of mysqltest inherits the sanitizer runtime and LSAN_OPTIONS=exitcode=42
+# (see mysql-test-run.pl and lib/My/SafeProcess), so the status is not the one
+# of grep. The count grep prints is what the result file checks; a grep that
+# found nothing or failed to run prints nothing, which fails the test anyway.
 --echo # Transactions found in the binary log:
---exec grep -c "^BEGIN" $MYSQLTEST_VARDIR/tmp/binlog_flush_thread_handshake.sql
+--exec grep -c "^BEGIN" $MYSQLTEST_VARDIR/tmp/binlog_flush_thread_handshake.sql || true
 --remove_file $MYSQLTEST_VARDIR/tmp/binlog_flush_thread_handshake.sql
 
 --connection con1
