@@ -205,37 +205,11 @@ inline void ReadViewBase::snapshot(trx_t *trx) {
   ut_d(m_view_low_limit_no = m_low_limit_no);
 }
 
-/** Opens a read view where exactly the transactions serialized before this
-point in time are seen in the view.
-
-View becomes visible to purge thread.
-@param[in,out] trx transaction
-
-Reuses closed view if there were no read-write transactions since (and at)
-its creation time.
-
-Original comment states: there is an inherent race here between purge
-and this thread.
-
-To avoid this race we should've checked trx_sys.get_max_trx_id() and
-set m_open atomically under ReadView::m_mutex protection. But we're cutting
-edges to achieve greater performance.
-
-There're at least two types of concurrent threads interested in this
-value: purge coordinator thread (see trx_sys_t::clone_oldest_view()) and
-InnoDB monitor thread (see lock_trx_print_wait_and_mvcc_state()).
-
-What bad things can happen because we allow this race?
-
-Speculative execution may reorder state change before get_max_trx_id().
-In this case purge thread has short gap to clone outdated view. Which is
-probably not that bad: it just won't be able to purge things that it was
-actually allowed to purge for a short while.
-
-This thread may as well get suspended after trx_sys.get_max_trx_id() and
-before m_open is set. New read-write transaction may get started, committed
-and purged meanwhile. It is acceptable as well, since this view doesn't see
-it. */
+/** Opens a read view where exactly the transactions serialized before
+this point in time are seen in the view. Reuse checks, snapshot
+construction and OPEN publication are protected by the view mutex shared
+with purge and monitor.
+@param[in,out] trx transaction */
 void ReadView::open(trx_t *trx) {
   ut_ad(this == trx->read_view);
 
@@ -244,17 +218,15 @@ void ReadView::open(trx_t *trx) {
   } else if (likely(!srv_read_only_mode)) {
     m_creator_trx_id = trx->id;
 
-    if (trx_is_autocommit_non_locking(trx) && empty() &&
-        low_limit_id() == trx_sys->get_max_trx_id()) {
-      m_open.store(true, std::memory_order_relaxed);
-    } else {
-      mutex_enter(&m_mutex);
+    mutex_enter(&m_mutex);
 
+    if (!(trx_is_autocommit_non_locking(trx) && empty() &&
+          low_limit_id() == trx_sys->get_max_trx_id())) {
       snapshot(trx);
-      m_open.store(true, std::memory_order_relaxed);
-
-      mutex_exit(&m_mutex);
     }
+    m_open.store(true, std::memory_order_relaxed);
+
+    mutex_exit(&m_mutex);
   }
 }
 
