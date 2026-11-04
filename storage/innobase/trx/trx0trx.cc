@@ -1570,10 +1570,6 @@ static void trx_release_impl_and_expl_locks(trx_t *trx, bool serialized) {
     trx_sys->n_prepared_trx.fetch_sub(1);
   }
 
-  if (trx->id > 0 && !trx_sys->is_shutdown) {
-    trx_sys->deregister_rw(trx);
-  }
-
   trx_mutex_enter(trx);
   /* Please consider this particular point in time as the moment the trx's
   implicit locks become released.
@@ -1586,6 +1582,12 @@ static void trx_release_impl_and_expl_locks(trx_t *trx, bool serialized) {
   holder. */
   trx->state = TRX_STATE_COMMITTED_IN_MEMORY;
   trx_mutex_exit(trx);
+
+  /* A reader may already hold a reference to this owner. Publish its
+  committed state before new lookups can stop finding it in the hash. */
+  if (trx->id > 0 && !trx_sys->is_shutdown) {
+    trx_sys->deregister_rw(trx);
+  }
 
   lock_trx_release_locks(trx);
 }

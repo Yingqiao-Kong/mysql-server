@@ -3569,9 +3569,6 @@ dberr_t lock_table(ulint flags, /*!< in: if BTR_NO_LOCKING_FLAG bit is set,
           row_discard_tablespace
             (there is some long explanation starting with "How do we prevent
             crashes caused by ongoing operations...")
-    lock_remove_recovered_trx_record_locks
-      (this seems to be used to remove locks of recovered transactions from
-      table being dropped, and recovered transactions shouldn't call lock_table)
   Also the InnoDB Memcached plugin causes a callchain:
   innodb_store -> innodb_conn_init -> innodb_api_begin -> innodb_cb_cursor_lock
   -> ib_cursor_set_lock_mode -> ib_cursor_lock -> ib_trx_lock_table_with_retry

@@ -283,10 +283,13 @@ class rw_trx_hash_t {
         lf_hash_search(&hash, pins, reinterpret_cast<const void *>(&trx_id),
                        sizeof(trx_id_t)));
 
+    /* Allocation failures are fatal, as for pins, insert and erase. Never
+    interpret the LF error sentinel as either an element or a missing ID. */
+    ut_a(element != MY_LF_ERRPTR);
+
     if (element) {
       mutex_enter(&element->mutex);
 
-      lf_hash_search_unpin(pins);
       if ((trx = element->trx)) {
         ut_d(validate_element(trx));
         if (do_ref_count) {
@@ -295,6 +298,7 @@ class rw_trx_hash_t {
       }
 
       mutex_exit(&element->mutex);
+      lf_hash_search_unpin(pins);
     } else {
       lf_hash_search_unpin(pins);
     }
