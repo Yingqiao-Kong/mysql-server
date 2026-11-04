@@ -723,6 +723,10 @@ class Space_Ids : public std::vector<space_id_t, ut_allocator<space_id_t>> {
 /** The transaction system central memory data structure. */
 struct trx_sys_t {
  private:
+  /** Allocated objects, including background and recovered transactions.
+  Protected by mutex; separate from the MySQL connection list. */
+  trx_ut_list_t trx_list;
+
   /** The smallest number not yet assigned as a transaction id or transaction
   number. Accessed and updated with atomic operations. */
   char pad0[ut::INNODB_CACHE_LINE_SIZE];
@@ -739,6 +743,42 @@ struct trx_sys_t {
   char pad2[ut::INNODB_CACHE_LINE_SIZE];
 
 public:
+  /** Initialize the object registry during single-threaded startup. */
+  void init_trx_list() {
+    UT_LIST_INIT(trx_list, &trx_t::trx_list);
+  }
+
+  void register_trx(trx_t *trx) {
+    mutex_enter(&mutex);
+    UT_LIST_ADD_FIRST(trx_list, trx);
+    mutex_exit(&mutex);
+  }
+
+  void unregister_trx(trx_t *trx) {
+    mutex_enter(&mutex);
+    UT_LIST_REMOVE(trx_list, trx);
+    mutex_exit(&mutex);
+  }
+
+  /** Visit allocated objects while the caller holds mutex. The visitor must
+  not release mutex or free objects. Returning true stops the traversal. */
+  template <typename Visitor> void for_each_trx(Visitor visitor) const {
+#ifndef UNIV_LIBRARY
+    ut_ad(mutex.is_owned());
+#endif /* !UNIV_LIBRARY */
+    for (trx_t *trx = UT_LIST_GET_FIRST(trx_list); trx != nullptr;
+         trx = UT_LIST_GET_NEXT(trx_list, trx)) {
+      if (visitor(trx)) {
+        break;
+      }
+    }
+  }
+
+  /** Only used after all transaction owners have stopped. */
+  bool trx_list_empty() const {
+    return UT_LIST_GET_LEN(trx_list) == 0;
+  }
+
   TrxSysMutex mutex; /*!< mutex protecting mysql_trx_list and gtid */
 
 #ifdef UNIV_DEBUG
@@ -932,12 +972,12 @@ public:
     size_t count = 0;
 
     mutex_enter(&mutex);
-    for (const trx_t *trx = UT_LIST_GET_FIRST(mysql_trx_list); trx;
-         trx = UT_LIST_GET_NEXT(mysql_trx_list, trx)) {
+    for_each_trx([&count](const trx_t *trx) {
       if (trx->read_view->is_open()) {
         ++count;
       }
-    }
+      return false;
+    });
     mutex_exit(&mutex);
 
     return count;

@@ -240,10 +240,10 @@ void trx_sys_t::clone_oldest_view(ReadViewBase *view) const {
 
   trx_sys_mutex_enter();
   /* Find oldest view. */
-  for (const trx_t *trx = UT_LIST_GET_FIRST(mysql_trx_list); trx;
-       trx = UT_LIST_GET_NEXT(mysql_trx_list, trx)) {
+  for_each_trx([view](const trx_t *trx) {
     trx->read_view->append_to(view);
-  }
+    return false;
+  });
   trx_sys_mutex_exit();
 
   /* Update view to block purging transaction till GTID is persisted. */

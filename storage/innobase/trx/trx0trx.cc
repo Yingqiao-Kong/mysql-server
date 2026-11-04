@@ -492,6 +492,8 @@ Release a trx_t instance back to the pool.
 static void trx_free(trx_t *&trx) {
   assert_trx_is_free(trx);
 
+  trx_sys->unregister_trx(trx);
+
   trx_sys->rw_trx_hash.put_pins(trx);
 
   trx->mysql_thd = nullptr;
@@ -525,6 +527,7 @@ trx_t *trx_allocate_for_background(void) {
   trx = trx_create_low();
 
   trx->sess = trx_dummy_sess;
+  trx_sys->register_trx(trx);
 
   return (trx);
 }
@@ -775,6 +778,24 @@ void trx_resurrect_locks() {
 
 static void trx_resurrect_callback(trx_undo_t *undo, trx_rseg_t *rseg,
     ib_time_t start_time, bool is_old_insert) {
+  /* Completed legacy undo does not need a transaction object. Initialize
+  the cleanup descriptor before touching disk; in forced recovery leave disk
+  untouched but remove the memory object from the active list. */
+  if (undo->state != TRX_UNDO_ACTIVE && undo->state != TRX_UNDO_PREPARED) {
+    if (is_old_insert && srv_force_recovery < SRV_FORCE_NO_TRX_UNDO) {
+      trx_undo_ptr_t redo{rseg, undo, nullptr};
+      trx_undo_insert_cleanup(&redo, false);
+    } else {
+      if (is_old_insert) {
+        UT_LIST_REMOVE(rseg->insert_undo_list, undo);
+      } else {
+        UT_LIST_REMOVE(rseg->update_undo_list, undo);
+      }
+      trx_undo_mem_free(undo);
+    }
+    return;
+  }
+
   trx_t *trx = trx_allocate_for_background();
 
   /* This is single-threaded startup code, we do not need the
@@ -802,9 +823,7 @@ static void trx_resurrect_callback(trx_undo_t *undo, trx_rseg_t *rseg,
       }
       break;
     default:
-      if (is_old_insert && srv_force_recovery < SRV_FORCE_NO_TRX_UNDO)
-        trx_undo_insert_cleanup(&trx->rsegs.m_redo, false);
-      return;
+      ut_error;
   }
 
   ut_d(trx->start_file = __FILE__);
@@ -833,6 +852,7 @@ static void trx_resurrect_callback(trx_undo_t *undo, trx_rseg_t *rseg,
   trx->is_recovered = true;
   trx->start_time = start_time;
 
+  trx->ddl_operation = undo->dict_operation;
   if (undo->dict_operation) {
     trx_set_dict_operation(trx, TRX_DICT_OP_TABLE);
   }
@@ -852,19 +872,22 @@ the time of a crash, they need to be undone.
 @param[in]	rseg	rollback segment */
 static void trx_resurrect(trx_rseg_t *rseg) {
   trx_undo_t *undo;
+  trx_undo_t *next;
   const ib_time_t start_time = ut_time();
 
   ut_ad(rseg != nullptr);
 
   /* Resurrect transactions that were doing inserts. */
   for (undo = UT_LIST_GET_FIRST(rseg->insert_undo_list); undo != nullptr;
-       undo = UT_LIST_GET_NEXT(undo_list, undo)) {
+       undo = next) {
+    next = UT_LIST_GET_NEXT(undo_list, undo);
     trx_resurrect_callback(undo, rseg, start_time, true);
   }
 
   /* Ressurrect transactions that were doing updates. */
   for (undo = UT_LIST_GET_FIRST(rseg->update_undo_list); undo != nullptr;
-       undo = UT_LIST_GET_NEXT(undo_list, undo)) {
+       undo = next) {
+    next = UT_LIST_GET_NEXT(undo_list, undo);
     trx_t *trx = trx_sys->find(current_trx(), undo->trx_id, false);
 
     if (!trx) {
@@ -883,6 +906,11 @@ static void trx_resurrect(trx_rseg_t *rseg) {
         undo->set_prepared(trx->xid);
       }
       ut_ad(undo->xid.eq(trx->xid));
+
+      trx->ddl_operation = undo->dict_operation;
+      if (undo->dict_operation) {
+        trx_set_dict_operation(trx, TRX_DICT_OP_TABLE);
+      }
 
       trx->rsegs.m_redo.update_undo = undo;
       if (!undo->empty && undo->top_undo_no >= trx->undo_no) {

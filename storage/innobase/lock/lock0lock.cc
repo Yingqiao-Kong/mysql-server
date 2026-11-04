@@ -4518,30 +4518,6 @@ void lock_print_info_summary(FILE *file) {
 #endif /* PRINT_NUM_OF_LOCK_STRUCTS */
 }
 
-/** Functor to print not-started transaction from the mysql_trx_list. */
-
-struct PrintNotStarted {
-  PrintNotStarted(FILE *file) : m_file(file) {}
-
-  void operator()(const trx_t *trx) {
-    /* We require exclusive access to lock_sys */
-    ut_ad(locksys::owns_exclusive_global_latch());
-    ut_ad(trx->in_mysql_trx_list);
-    ut_ad(mutex_own(&trx_sys->mutex));
-
-    /* See state transitions and locking rules in trx0trx.h */
-
-    trx_mutex_enter(trx);
-    if (trx_state_eq(trx, TRX_STATE_NOT_STARTED)) {
-      fputs("---", m_file);
-      trx_print_latched(m_file, trx, 600);
-    }
-    trx_mutex_exit(trx);
-  }
-
-  FILE *m_file;
-};
-
 /** Prints transaction lock wait and MVCC state.
 @param[in,out]	file	file where to print
 @param[in]	trx	transaction */
@@ -4551,7 +4527,9 @@ void lock_trx_print_wait_and_mvcc_state(FILE *file, const trx_t *trx) {
   ut_ad(locksys::owns_exclusive_global_latch());
   fprintf(file, "---");
 
+  trx_mutex_enter(trx);
   trx_print_latched(file, trx, 600);
+  trx_mutex_exit(trx);
 
   trx->read_view->print_limits(file);
 
@@ -4598,45 +4576,19 @@ void lock_trx_print_locks(FILE *file, const trx_t *trx) {
   }
 }
 
-static bool lock_trx_print_locks_callback(
-    rw_trx_hash_element_t *element, FILE *file) {
-  mutex_enter(&element->mutex);
-
-  if (trx_t *trx = element->trx) {
-    check_trx_state(trx);
-    lock_trx_print_wait_and_mvcc_state(file, trx);
-
-    if (srv_print_innodb_lock_monitor) {
-      trx->reference();
-      mutex_exit(&element->mutex);
-      lock_trx_print_locks(file, trx);
-      trx->release_reference();
-      return false;
-    }
-  }
-
-  mutex_exit(&element->mutex);
-  return false;
-}
-
 void lock_print_info_all_transactions(FILE *file) {
-  /* We require exclusive access to lock_sys */
   ut_ad(locksys::owns_exclusive_global_latch());
-
   fprintf(file, "LIST OF TRANSACTIONS FOR EACH SESSION:\n");
 
-  /* First print info on non-active transactions */
-
-  /* NOTE: information of auto-commit non-locking read-only
-  transactions will be omitted here. The information will be
-  available from INFORMATION_SCHEMA.INNODB_TRX. */
-
-  PrintNotStarted print_not_started(file);
   trx_sys_mutex_enter();
-  ut_list_map(trx_sys->mysql_trx_list, print_not_started);
+  trx_sys->for_each_trx([file](const trx_t *trx) {
+    lock_trx_print_wait_and_mvcc_state(file, trx);
+    if (srv_print_innodb_lock_monitor) {
+      lock_trx_print_locks(file, trx);
+    }
+    return false;
+  });
   trx_sys_mutex_exit();
-
-  trx_sys->rw_trx_hash.iterate(lock_trx_print_locks_callback, file);
 }
 
 #ifdef UNIV_DEBUG

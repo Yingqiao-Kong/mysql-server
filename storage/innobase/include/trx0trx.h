@@ -1224,6 +1224,10 @@ struct trx_t {
         n_ref.fetch_sub(1, std::memory_order_relaxed);
     ut_ad(old_n_ref > 0);
   }
+ private:
+  friend struct trx_sys_t;
+  /** Link in the registry of allocated transaction objects. */
+  UT_LIST_NODE_T(trx_t) trx_list;
 };
 #ifndef UNIV_HOTBACKUP
 

@@ -476,6 +476,7 @@ void trx_sys_create(void) {
   mutex_create(LATCH_ID_TRX_SYS, &trx_sys->mutex);
 
   UT_LIST_INIT(trx_sys->mysql_trx_list, &trx_t::mysql_trx_list);
+  trx_sys->init_trx_list();
 
   ut_d(trx_sys->rw_max_trx_no = 0);
 
@@ -508,11 +509,13 @@ static bool trx_free_prepared_or_active_recovered_callback(
 
   mutex_enter(&elem->mutex);
   trx_t *trx = elem->trx;
+  elem->trx = nullptr;
+  mutex_exit(&elem->mutex);
+  /* Shutdown has stopped all owners. Object unregistering takes trx_sys
+  mutex, so it must not run while holding an element mutex. */
   if (trx) {
     trx_free_prepared_or_active_recovered(trx);
-    elem->trx = nullptr;
   }
-  mutex_exit(&elem->mutex);
   return false;
 }
 
@@ -551,6 +554,8 @@ void trx_sys_close(void) {
   trx_sys->tmp_rsegs.~Rsegs();
 
   ut_a(UT_LIST_GET_LEN(trx_sys->mysql_trx_list) == 0);
+
+  ut_a(trx_sys->trx_list_empty());
 
   trx_sys->rw_trx_hash.destroy();
 

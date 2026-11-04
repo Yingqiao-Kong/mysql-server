@@ -146,19 +146,16 @@ static const size_t g_engine_length = 6;
 /** Pass of a given scan. */
 enum scan_pass {
   INIT_SCANNING,
-  /** Scan the MySQL trx list.
-  @sa trx_t::mysql_trx_list
+  /** Scan all allocated transaction objects.
+  @sa trx_sys_t::for_each_trx
   */
-  SCANNING_MYSQL_TRX_LIST,
+  SCANNING_TRX_LIST,
   DONE_SCANNING
 };
 
 /** State of a given scan.
 Scans are restartable, and done in multiple calls.
-Overall, the code scans separately:
-- the RW trx list
-- the MySQL trx list
-For each list, the scan is done by ranges of trx_id values.
+The object registry is scanned by ranges of trx_id values.
 Saving the current scan state allows to resume where the previous
 scan ended.
 */
@@ -191,12 +188,12 @@ class Innodb_trx_scan_state {
     } else {
       switch (m_scan_pass) {
         case INIT_SCANNING:
-          m_scan_pass = SCANNING_MYSQL_TRX_LIST;
+          m_scan_pass = SCANNING_TRX_LIST;
           m_start_trx_id_range = 0;
           m_end_trx_id_range = SCAN_RANGE;
           m_next_trx_id_range = TRX_ID_MAX;
           break;
-        case SCANNING_MYSQL_TRX_LIST:
+        case SCANNING_TRX_LIST:
           m_scan_pass = DONE_SCANNING;
           break;
         case DONE_SCANNING:
@@ -357,25 +354,19 @@ bool discard_trx(const trx_t *trx, bool read_write) {
 */
 static const trx_t *fetch_trx_in_trx_list(uint64_t filter_trx_immutable_id,
                                           bool read_write) {
-  const trx_t *trx;
-
-  /* It is not obvious if and why we need lock_sys exclusive access, but we do
-  own exclusive latch here, so treat this assert more as a documentation */
+  const trx_t *found = nullptr;
   ut_ad(locksys::owns_exclusive_global_latch());
   ut_ad(trx_sys_mutex_own());
 
-  for (trx = UT_LIST_GET_FIRST(trx_sys->mysql_trx_list); trx != nullptr;
-       trx = UT_LIST_GET_NEXT(mysql_trx_list, trx)) {
-    if (discard_trx(trx, read_write)) {
-      continue;
+  trx_sys->for_each_trx([&](const trx_t *trx) {
+    if (!discard_trx(trx, read_write) &&
+        filter_trx_immutable_id == trx_immutable_id(trx)) {
+      found = trx;
+      return true;
     }
-
-    if (filter_trx_immutable_id == trx_immutable_id(trx)) {
-      return trx;
-    }
-  }
-
-  return nullptr;
+    return false;
+  });
+  return found;
 }
 
 Innodb_data_lock_inspector::Innodb_data_lock_inspector() {}
@@ -569,7 +560,7 @@ bool Innodb_data_lock_iterator::scan(PSI_server_data_lock_container *container,
 
   size_t found = 0;
 
-  while ((m_scan_state.get_pass() == SCANNING_MYSQL_TRX_LIST) && (found == 0)) {
+  while ((m_scan_state.get_pass() == SCANNING_TRX_LIST) && (found == 0)) {
     found = scan_trx_list(container, with_lock_data, true);
     m_scan_state.prepare_next_scan();
   }
@@ -626,30 +617,17 @@ needs to be populated.
 size_t Innodb_data_lock_iterator::scan_trx_list(
     PSI_server_data_lock_container *container, bool with_lock_data,
     bool read_write) {
-  const trx_t *trx;
-  trx_id_t trx_id;
   size_t found = 0;
-
-  /* We are about to scan over various locks of multiple transactions not
-  limited to any particular shard thus we need an exclusive latch on lock_sys */
   ut_ad(locksys::owns_exclusive_global_latch());
   ut_ad(trx_sys_mutex_own());
 
-  for (trx = UT_LIST_GET_FIRST(trx_sys->mysql_trx_list); trx != nullptr;
-       trx = UT_LIST_GET_NEXT(mysql_trx_list, trx)) {
-    if (discard_trx(trx, read_write)) {
-      continue;
+  trx_sys->for_each_trx([&](const trx_t *trx) {
+    if (!discard_trx(trx, read_write) &&
+        m_scan_state.trx_id_in_range(trx_get_id_for_print(trx))) {
+      found += scan_trx(container, with_lock_data, trx, false);
     }
-
-    trx_id = trx_get_id_for_print(trx);
-
-    if (!m_scan_state.trx_id_in_range(trx_id)) {
-      continue;
-    }
-
-    found += scan_trx(container, with_lock_data, trx, false);
-  }
-
+    return false;
+  });
   return found;
 }
 
@@ -829,7 +807,7 @@ bool Innodb_data_lock_wait_iterator::scan(
 
   size_t found = 0;
 
-  while ((m_scan_state.get_pass() == SCANNING_MYSQL_TRX_LIST) && (found == 0)) {
+  while ((m_scan_state.get_pass() == SCANNING_TRX_LIST) && (found == 0)) {
     found = scan_trx_list(container, true);
     m_scan_state.prepare_next_scan();
   }
@@ -899,30 +877,17 @@ bool Innodb_data_lock_wait_iterator::fetch(
 */
 size_t Innodb_data_lock_wait_iterator::scan_trx_list(
     PSI_server_data_lock_wait_container *container, bool read_write) {
-  const trx_t *trx;
-  trx_id_t trx_id;
   size_t found = 0;
-
-  /* We are about to scan over various locks of multiple transactions not
-  limited to any particular shard thus we need an exclusive latch on lock_sys */
   ut_ad(locksys::owns_exclusive_global_latch());
   ut_ad(trx_sys_mutex_own());
 
-  for (trx = UT_LIST_GET_FIRST(trx_sys->mysql_trx_list); trx != nullptr;
-       trx = UT_LIST_GET_NEXT(mysql_trx_list, trx)) {
-    if (discard_trx(trx, read_write)) {
-      continue;
+  trx_sys->for_each_trx([&](const trx_t *trx) {
+    if (!discard_trx(trx, read_write) &&
+        m_scan_state.trx_id_in_range(trx_get_id_for_print(trx))) {
+      found += scan_trx(container, trx, false);
     }
-
-    trx_id = trx_get_id_for_print(trx);
-
-    if (!m_scan_state.trx_id_in_range(trx_id)) {
-      continue;
-    }
-
-    found += scan_trx(container, trx, false);
-  }
-
+    return false;
+  });
   return found;
 }
 
