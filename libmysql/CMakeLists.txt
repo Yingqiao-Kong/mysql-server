@@ -225,8 +225,13 @@ SET(LIBS_TO_LINK ${LIBDL})
 
 # MERGE_CONVENIENCE_LIBRARIES does not propagate my_hygon's
 # INTERFACE link requirements; repeat the LTO symbol requirement here.
-IF(MY_COMPILER_IS_GNU AND (WITH_LTO OR CMAKE_COMPILER_FLAG_WITH_LTO))
-  LIST(APPEND LIBS_TO_LINK "-Wl,-u,my_cpu_is_hygon")
+IF(MY_COMPILER_IS_GNU_OR_CLANG AND
+   (WITH_LTO OR CMAKE_COMPILER_FLAG_WITH_LTO))
+  IF(APPLE)
+    LIST(APPEND LIBS_TO_LINK "-Wl,-u,_my_cpu_is_hygon")
+  ELSE()
+    LIST(APPEND LIBS_TO_LINK "-Wl,-u,my_cpu_is_hygon")
+  ENDIF()
 ENDIF()
 
 IF(WITH_ZLIB STREQUAL "bundled")
