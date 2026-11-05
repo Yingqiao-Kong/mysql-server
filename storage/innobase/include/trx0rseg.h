@@ -214,10 +214,6 @@ this page is placed */
 #define TRX_RSEG_FSEG_HEADER (8 + FLST_BASE_NODE_SIZE)
 /* Undo log segment slots */
 #define TRX_RSEG_UNDO_SLOTS (8 + FLST_BASE_NODE_SIZE + FSEG_HEADER_SIZE)
-/* Maximum transaction ID (valid only if TRX_RSEG_FORMAT is 0) */
-#define TRX_RSEG_MAX_TRX_ID (TRX_RSEG_UNDO_SLOTS + TRX_RSEG_N_SLOTS \
-  * TRX_RSEG_SLOT_SIZE)
-
 /* End of undo slots in rollback segment page. */
 #define TRX_RSEG_SLOT_END \
   (TRX_RSEG_UNDO_SLOTS + (TRX_RSEG_SLOT_SIZE * TRX_RSEG_N_SLOTS))

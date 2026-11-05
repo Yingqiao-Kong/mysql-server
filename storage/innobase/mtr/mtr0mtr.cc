@@ -47,6 +47,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #ifndef UNIV_HOTBACKUP
 #include "page0types.h"
 #include "trx0purge.h"
+#include "trx0sys.h"
 #endif /* !UNIV_HOTBACKUP */
 
 static_assert(static_cast<int>(MTR_MEMO_PAGE_S_FIX) ==
@@ -886,6 +887,20 @@ int mtr_t::Logging::enable(THD *thd) {
     m_state.store(DISABLED);
     return err;
   }
+
+  /* Advance the LSN even when all no-redo modifications used the last
+  checkpoint LSN. Otherwise log_make_latest_checkpoint() may return without
+  flushing those dirty pages. Preserve the reserved ID upper bound while
+  holding the TRX_SYS page latch; writing the current allocation ID here could
+  shrink a reservation made by another thread. */
+  mtr_t mtr;
+  mtr.start();
+  trx_sysf_t *header = trx_sysf_get(&mtr);
+  const trx_id_t reserved = mach_read_from_8(header + TRX_SYS_TRX_ID_STORE);
+  mlog_write_ull(header + TRX_SYS_TRX_ID_STORE, reserved, &mtr);
+  mtr.commit();
+
+  DEBUG_SYNC_C("redo_enable_before_checkpoint");
 
   /* It would ensure that the modified page in previous mtr and all other
   pages modified before are flushed to disk. Since there could be large

@@ -1272,7 +1272,18 @@ static bool trx_serialisation_number_get(
     hold_mutex = true;
    }
 
-  trx_sys->assign_new_trx_no(trx);
+  while (!trx_sys->try_assign_new_trx_no(trx)) {
+    /* Keep the rseg mutexes, but do not acquire TRX_SYS_HEADER below the
+    purge queue latch. Successful numbering and enqueue remain serialized. */
+    if (hold_mutex) {
+      mutex_exit(&purge_sys->pq_mutex);
+    }
+    DEBUG_SYNC_C("trx_sys_serialisation_reserve");
+    trx_sys->reserve_trx_ids();
+    if (hold_mutex) {
+      mutex_enter(&purge_sys->pq_mutex);
+    }
+  }
 
   /* Update the latest transaction number. */
   ut_d(trx_sys->rw_max_trx_no = trx->no);

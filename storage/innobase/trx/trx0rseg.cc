@@ -243,7 +243,7 @@ trx_rseg_t *trx_rseg_mem_create(ulint id, space_id_t space_id,
   auto rseg_header = trx_rsegf_get_new(space_id, page_no, page_size, mtr);
 
   if (mach_read_from_4(rseg_header + TRX_RSEG_FORMAT) == 0) {
-    trx_id_t id = mach_read_from_8(rseg_header + TRX_RSEG_MAX_TRX_ID);
+    trx_id_t id = mach_read_from_8(rseg_header + TRX_RSEG_MAX_TRX_NO);
     if (id > max_trx_id) {
       max_trx_id = id;
     }
@@ -447,6 +447,7 @@ void trx_rsegs_init(purge_pq_t *purge_queue) {
     }
   }
 
+  ut_a(max_trx_id < (1ULL << 48));
   trx_sys->init_max_trx_id(max_trx_id + 1);
   undo::spaces->s_unlock();
 }

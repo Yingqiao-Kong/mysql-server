@@ -589,11 +589,8 @@ void trx_sys_undo_spaces_deinit();
 
 /** Transaction system header */
 /*------------------------------------------------------------- @{ */
-/** In old versions of InnoDB, this persisted the value of
-get_max_trx_id(). Now, the field TRX_RSEG_MAX_TRX_ID in rollback
-segment header pages and the fields TRX_UNDO_TRX_ID, TRX_UNDO_TRX_NO
-in undo log pages are used instead. The field only exists for the
-purpose of upgrading from older MySQL or MariaDB versions. */
+/** Exclusive upper bound reserved for transaction IDs and serial numbers.
+Older MySQL versions stored a block base here; startup retains their margin. */
 #define TRX_SYS_TRX_ID_STORE 0
 #define TRX_SYS_FSEG_HEADER     \
   8 /*!< segment header for the \
@@ -732,10 +729,16 @@ struct trx_sys_t {
   char pad0[ut::INNODB_CACHE_LINE_SIZE];
   std::atomic<trx_id_t> m_max_trx_id;
 
+  /** Exclusive upper bound whose redo MTR has committed. Published only after
+  the TRX_SYS page update; never decreases while the server is running. */
+  std::atomic<trx_id_t> m_reserved_trx_id;
+  static constexpr trx_id_t TRX_ID_RESERVE_MARGIN = 256;
+  static constexpr trx_id_t TRX_ID_LIMIT = 1ULL << 48;
+
   /** Solves race conditions between register_rw() and snapshot_ids()
-  as well as race condition between assign_new_trx_no() and snapshot_ids().
+  as well as race condition between try_assign_new_trx_no() and snapshot_ids().
   @sa register_rw()
-  @sa assign_new_trx_no()
+  @sa try_assign_new_trx_no()
   @sa snapshot_ids() */
   char pad1[ut::INNODB_CACHE_LINE_SIZE];
   std::atomic<trx_id_t> m_rw_trx_hash_version;
@@ -876,11 +879,22 @@ public:
   trx->rw_trx_hash_element->no becomes visible through rw_trx_hash.
 
   @param trx transaction */
-  void assign_new_trx_no(trx_t *trx) {
-    trx->no = get_new_trx_id_no_refresh();
+  bool try_assign_new_trx_no(trx_t *trx) {
+    if (!try_get_new_trx_id_no_refresh(&trx->no)) {
+      return false;
+    }
     trx->rw_trx_hash_element->no.store(trx->no, std::memory_order_relaxed);
     refresh_rw_trx_hash_version();
+    return true;
   }
+
+  /** Reserve another block before allocating an ID. Caller must not hold
+  purge_sys->pq_mutex or trx_sys->mutex. Does not create a max/version gap. */
+  void reserve_trx_ids();
+
+  /** Merge recovered high water marks with the compatible TRX_SYS margin,
+  then reserve before startup can discard completed legacy undo. */
+  void init_trx_id_reservation();
 
   /** Takes MVCC snapshot.
 
@@ -888,7 +902,7 @@ public:
   in ids.
 
   For details about get_rw_trx_hash_version() != get_max_trx_id() spin
-  @sa register_rw() and @sa assign_new_trx_no().
+  @sa register_rw() and @sa try_assign_new_trx_no().
 
   We rely on get_rw_trx_hash_version() to issue ACQUIRE memory barrier so
   that loading of m_rw_trx_hash_version happens before accessing rw_trx_hash.
@@ -923,6 +937,7 @@ public:
   void init_max_trx_id(trx_id_t value) {
     m_max_trx_id = value;
     m_rw_trx_hash_version.store(value, std::memory_order_relaxed);
+    m_reserved_trx_id.store(0, std::memory_order_relaxed);
   }
 
   /** Registers read-write transaction.
@@ -942,7 +957,9 @@ public:
   that m_rw_trx_hash_version increment happens after transaction becomes
   visible through rw_trx_hash. */
   void register_rw(trx_t *trx) {
-    trx->id = get_new_trx_id_no_refresh();
+    while (!try_get_new_trx_id_no_refresh(&trx->id)) {
+      reserve_trx_ids();
+    }
     rw_trx_hash.insert(trx);
     refresh_rw_trx_hash_version();
   }
@@ -1028,23 +1045,21 @@ private:
     m_rw_trx_hash_version.fetch_add(1, std::memory_order_release);
   }
 
-  /** Allocates new transaction id without refreshing rw_trx_hash version.
-
-  This method is extracted for exclusive use by register_rw() and
-  assign_new_trx_no() where new id must be allocated atomically with
-  payload of these methods from MVCC snapshot point of view.
-
-  VERY important: after the database is started, max_trx_id value is
-  divisible by TRX_SYS_TRX_ID_WRITE_MARGIN, and the following if
-  will evaluate to TRUE when this function is first time called,
-  and the value for trx id will be written to disk-based header!
-  Thus trx id values will not overlap when the database is
-  repeatedly started!
-
-  @sa assign_new_trx_no()
-  @return new transaction id */
-  trx_id_t get_new_trx_id_no_refresh() {
-    return m_max_trx_id.fetch_add(1, std::memory_order_relaxed);
+  /** Allocate only from a reserved block. Failure has no side effects:
+  callers may release lower-level locks and reserve before retrying.
+  Successful callers must publish the payload and refresh the hash version. */
+  bool try_get_new_trx_id_no_refresh(trx_id_t *id) {
+    trx_id_t next = m_max_trx_id.load(std::memory_order_relaxed);
+    for (;;) {
+      if (next >= m_reserved_trx_id.load(std::memory_order_acquire)) {
+        return false;
+      }
+      if (m_max_trx_id.compare_exchange_weak(next, next + 1,
+                                            std::memory_order_relaxed)) {
+        *id = next;
+        return true;
+      }
+    }
   }
 };
 #endif /* !UNIV_HOTBACKUP */

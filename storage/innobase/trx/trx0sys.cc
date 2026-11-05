@@ -404,6 +404,61 @@ static bool trx_undo_count_callback(rw_trx_hash_element_t *element,
   return false;
 }
 
+/** Persist a reservation before publishing it to ID allocators. The redo
+record precedes persistent changes that use the IDs, following normal WAL;
+this is not a separate fsync guarantee for memory-only transactions. */
+void trx_sys_t::reserve_trx_ids() {
+  ut_ad(!mutex_own(&mutex));
+  const trx_id_t current = get_max_trx_id();
+  ut_a(current < TRX_ID_LIMIT);
+
+  if (srv_read_only_mode || srv_force_recovery >= SRV_FORCE_NO_IBUF_MERGE) {
+    /* These modes must not update persistent transaction metadata. */
+    m_reserved_trx_id.store(TRX_ID_LIMIT, std::memory_order_release);
+    return;
+  }
+
+  mtr_t mtr;
+  mtr.start();
+  trx_sysf_t *header = trx_sysf_get(&mtr);
+  trx_id_t upper = mach_read_from_8(header + TRX_SYS_TRX_ID_STORE);
+  ut_a(upper <= TRX_ID_LIMIT);
+  const trx_id_t requested = current <= TRX_ID_LIMIT - TRX_ID_RESERVE_MARGIN
+                                 ? current + TRX_ID_RESERVE_MARGIN
+                                 : TRX_ID_LIMIT;
+  if (upper < requested) {
+    upper = requested;
+    mlog_write_ull(header + TRX_SYS_TRX_ID_STORE, upper, &mtr);
+  }
+  DEBUG_SYNC_C("trx_sys_before_reserve_commit");
+  mtr.commit();
+  DEBUG_SYNC_C("trx_sys_before_reserve_publish");
+
+  trx_id_t previous = m_reserved_trx_id.load(std::memory_order_relaxed);
+  while (previous < upper &&
+         !m_reserved_trx_id.compare_exchange_weak(
+             previous, upper, std::memory_order_release,
+             std::memory_order_relaxed)) {
+  }
+}
+
+void trx_sys_t::init_trx_id_reservation() {
+  mtr_t mtr;
+  mtr.start();
+  trx_sysf_t *header = trx_sysf_get(&mtr);
+  const trx_id_t stored = mach_read_from_8(header + TRX_SYS_TRX_ID_STORE);
+  mtr.commit();
+
+  const trx_id_t recovered = std::max(stored, get_max_trx_id());
+  /* Guard both alignment and margin arithmetic in Release as well. */
+  ut_a(recovered <= TRX_ID_LIMIT - 3 * TRX_ID_RESERVE_MARGIN);
+  const trx_id_t next =
+      ut_uint64_align_up(recovered, TRX_ID_RESERVE_MARGIN) +
+      2 * TRX_ID_RESERVE_MARGIN;
+  init_max_trx_id(next);
+  reserve_trx_ids();
+}
+
 /** Creates and initializes the central memory structures for the transaction
  system. This is called when the database is started.
  @return min binary heap of rsegs to purge */
@@ -424,6 +479,8 @@ purge_pq_t *trx_sys_init_at_db_start(void) {
     RSEG_ARRAY page. */
     trx_rsegs_init(purge_queue);
   }
+
+  trx_sys->init_trx_id_reservation();
 
 #ifdef UNIV_DEBUG
   /* max_trx_id is the next transaction ID to assign. Initialize maximum

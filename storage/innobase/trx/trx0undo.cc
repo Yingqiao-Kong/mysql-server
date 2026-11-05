@@ -1351,7 +1351,10 @@ static trx_undo_t *trx_undo_mem_init(
     goto add_to_list;
   }
 
-  if (state == TRX_UNDO_TO_PURGE || state == TRX_UNDO_CACHED) {
+  /* Only update undo is assigned a commit serialisation number. Cached
+  insert undo may contain stale bytes here; they are not an ID high water. */
+  if (type == TRX_UNDO_UPDATE &&
+      (state == TRX_UNDO_TO_PURGE || state == TRX_UNDO_CACHED)) {
     trx_id = mach_read_from_8(undo_header + TRX_UNDO_TRX_NO);
     if (trx_id > max_trx_id) {
       max_trx_id = trx_id;
@@ -1831,6 +1834,15 @@ page_t *trx_undo_set_state_at_finish(
   undo->state = state;
 
   mlog_write_ulint(seg_hdr + TRX_UNDO_STATE, state, MLOG_2BYTES, mtr);
+
+  /* Insert undo has no commit serialisation number. Exercise recovery of
+  stale bytes in that unused field without changing the undo page format. */
+  DBUG_EXECUTE_IF("trx_sys_stale_insert_trx_no", {
+    if (undo->type == TRX_UNDO_INSERT && state == TRX_UNDO_CACHED) {
+      mlog_write_ull(undo_page + undo->hdr_offset + TRX_UNDO_TRX_NO,
+                     1ULL << 48, mtr);
+    }
+  });
 
   return (undo_page);
 }
