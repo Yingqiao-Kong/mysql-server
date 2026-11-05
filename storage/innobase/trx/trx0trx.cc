@@ -251,6 +251,7 @@ struct TrxFactory {
     new (&trx->lock.table_locks) lock_pool_t();
 
     trx->rw_trx_hash_pins = nullptr;
+    trx->rw_trx_hash_element = nullptr;
 
     ut_a(trx->read_view == nullptr);
     trx->read_view = new ReadView();
@@ -857,8 +858,7 @@ static void trx_resurrect_callback(trx_undo_t *undo, trx_rseg_t *rseg,
     trx_set_dict_operation(trx, TRX_DICT_OP_TABLE);
   }
 
-  trx_sys->rw_trx_hash.insert(trx);
-  trx_sys->rw_trx_hash.put_pins(trx);
+  trx_sys->resurrect_rw(trx);
   trx_resurrect_table_ids(trx, &trx->rsegs.m_redo, undo);
 
 #ifdef UNIV_DEBUG
@@ -1242,7 +1242,7 @@ static void trx_start_low(
 
 /** Set the transaction serialisation number.
  @return true if the transaction number was added to the
-              trx->rw_trx_hash_element->no. */
+              trx->no and the compact MVCC slot. */
 static bool trx_serialisation_number_get(
     trx_t *trx,                         /*!< in/out: transaction */
     trx_undo_ptr_t *redo_rseg_undo_ptr, /*!< in/out: Set trx
@@ -2570,7 +2570,9 @@ static void trx_prepare(trx_t *trx) /*!< in/out: transaction */
   /*--------------------------------------*/
   ut_a(trx->state == TRX_STATE_ACTIVE);
   trx_sys_mutex_enter();
+  trx_mutex_enter(trx);
   trx->state = TRX_STATE_PREPARED;
+  trx_mutex_exit(trx);
   trx_sys->n_prepared_trx.fetch_add(1);
   /* Add GTID to be persisted to disk table, if needed. */
   if (gtid_desc.m_is_set) {
@@ -2729,9 +2731,7 @@ static bool trx_recover_for_mysql_callback(
   mutex_enter(&element->mutex);
 
   if (trx_t *trx = element->trx) {
-    /** The state of a read-write transaction can only change from
-    ACTIVE to PREPARED while we are holding the element->mutex. But
-    since it is executed at startup no state change should occur. */
+    /* Startup is single-threaded: no concurrent state transition occurs. */
     if (trx_state_eq(trx, TRX_STATE_PREPARED)) {
       ut_ad(trx->is_recovered);
 
@@ -2922,12 +2922,9 @@ void trx_set_rw_mode(trx_t *trx) /*!< in/out: transaction that is RW */
     return;
   }
 
-  /* Function is promoting existing trx from ro mode to rw mode.
-  In this process it has acquired trx_sys->mutex as it plan to
-  move trx from ro list to rw list. If in future, some other thread
-  looks at this trx object while it is being promoted then ensure
-  that both threads are synced by acquring trx->mutex to avoid decision
-  based on in-consistent view formed during promotion. */
+  /* Promote the transaction from read-only to read-write. register_rw()
+  publishes its ID through the transaction slots before inserting it into
+  the hash; this caller does not hold trx_sys->mutex. */
 
   trx_assign_rseg_durable(trx);
 

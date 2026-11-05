@@ -773,6 +773,7 @@ static PSI_rwlock_info all_innodb_rwlocks[] = {
     PSI_RWLOCK_KEY(fts_cache_init_rw_lock, 0, PSI_DOCUMENT_ME),
     PSI_RWLOCK_KEY(trx_i_s_cache_lock, 0, PSI_DOCUMENT_ME),
     PSI_RWLOCK_KEY(trx_purge_latch, 0, PSI_DOCUMENT_ME),
+    PSI_RWLOCK_KEY(trx_sys_rw_trx_ids, 0, PSI_DOCUMENT_ME),
     PSI_RWLOCK_KEY(index_tree_rw_lock, 0, PSI_DOCUMENT_ME),
     PSI_RWLOCK_KEY(index_online_log, 0, PSI_DOCUMENT_ME),
     PSI_RWLOCK_KEY(dict_table_stats, 0, PSI_DOCUMENT_ME),

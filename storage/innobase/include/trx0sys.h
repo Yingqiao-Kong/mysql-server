@@ -71,10 +71,6 @@ struct rw_trx_hash_element_t {
 
   trx_id_t id; /* lf_hash_init() relies on this to be first in the struct */
 
-  /** Transaction serialization number.
-  Assigned shortly before the transaction is moved to COMMITTED_IN_MEMORY
-  state. Initially set to TRX_ID_MAX. */
-  std::atomic<trx_id_t> no;
   trx_t *trx;
   ib_mutex_t mutex;
 };
@@ -140,7 +136,6 @@ class rw_trx_hash_t {
     ut_ad(element->trx == 0);
     element->trx = trx;
     element->id = trx->id;
-    element->no = TRX_ID_MAX;
     trx->rw_trx_hash_element = element;
   }
 
@@ -160,7 +155,7 @@ class rw_trx_hash_t {
   }
 
   template <typename T> struct eliminate_duplicates_arg {
-    trx_ids_t ids;
+    ut::unordered_set<trx_id_t> ids;
     walk_action<T> *action;
     T *argument;
     eliminate_duplicates_arg(size_t size, walk_action<T> *act, T *arg):
@@ -170,12 +165,9 @@ class rw_trx_hash_t {
   template <typename T>
   static bool eliminate_duplicates(rw_trx_hash_element_t *element,
                                    eliminate_duplicates_arg<T> *arg) {
-    for (trx_ids_t::iterator it = arg->ids.begin();
-         it != arg->ids.end(); it++) {
-      if (*it == element->id)
-        return false;
+    if (!arg->ids.insert(element->id).second) {
+      return false;
     }
-    arg->ids.push_back(element->id);
     return arg->action(element, arg->argument);
   }
 
@@ -241,8 +233,9 @@ class rw_trx_hash_t {
 
   /** Finds trx object in lock-free hash with given id.
 
-  Only ACTIVE or PREPARED trx objects may participate in hash. Nevertheless
-  the transaction may get committed before this method returns.
+  Registered ACTIVE and PREPARED transactions, and briefly COMMITTED
+  transactions awaiting removal, may be found. A reference protects lifetime;
+  callers must use trx->mutex to inspect state.
 
   With do_ref_count == false the caller may dereference returned trx pointer
   only if lock_sys->mutex was acquired before calling find().
@@ -334,6 +327,7 @@ class rw_trx_hash_t {
     mutex_enter(&trx->rw_trx_hash_element->mutex);
     trx->rw_trx_hash_element->trx = nullptr;
     mutex_exit(&trx->rw_trx_hash_element->mutex);
+    trx->rw_trx_hash_element = nullptr;
 
     int res = lf_hash_delete(&hash, get_pins(trx),
                              reinterpret_cast<const void *>(&trx->id),
@@ -360,16 +354,10 @@ class rw_trx_hash_t {
   If caller doesn't like to see the same transaction multiple times, it has
   to call iterate_no_dups() instead.
 
-  May return element with committed transaction. If caller doesn't like to
-  see committed transactions, it has to skip those under element mutex:
-
-    mutex_enter(&element->mutex);
-    if (trx_t trx = element->trx)
-    {
-      // trx is protected against commit in this branch
-    }
-    mutex_exit(&element->mutex);
-
+  The callback must lock element->mutex before reading element->trx. That
+  mutex protects membership and object lifetime, not transaction state;
+  inspecting state also requires trx->mutex. Callbacks must not reenter this
+  hash because its operations share the caller's hazard pins.
   May miss concurrently inserted transactions.
 
   @return
@@ -720,6 +708,175 @@ class Space_Ids : public std::vector<space_id_t, ut_allocator<space_id_t>> {
 /** The transaction system central memory data structure. */
 struct trx_sys_t {
  private:
+  /** Compact MVCC traversal, adapted from MariaDB 241050cca82e.
+  The latch protects storage and slot ownership. Publication may run under S,
+  but clearing an ID requires X so snapshot membership remains stable during
+  a scan. The publication bound is revalidated after acquiring S. */
+  class rw_trx_vector_t {
+    struct slot_t {
+      std::atomic<trx_id_t> id{TRX_ID_MAX};
+      std::atomic<trx_id_t> no{TRX_ID_MAX};
+
+      slot_t() = default;
+      /* Only copied while the vector latch is exclusively held. */
+      slot_t(const slot_t &other)
+          : id(other.id.load(std::memory_order_relaxed)),
+            no(other.no.load(std::memory_order_relaxed)) {}
+      slot_t &operator=(const slot_t &other) {
+        id.store(other.id.load(std::memory_order_relaxed),
+                 std::memory_order_relaxed);
+        no.store(other.no.load(std::memory_order_relaxed),
+                 std::memory_order_relaxed);
+        return *this;
+      }
+    };
+
+    ut::vector<slot_t> m_ids;
+    ut::vector<trx_t *> m_trxs;
+    /** Monotone lower bound, refreshed by complete validated snapshots.
+    Zero before the first snapshot is deliberately conservative. */
+    std::atomic<trx_id_t> m_min_trx_id{0};
+    /* Follow Rsegs ownership: rw_lock_free explicitly destroys the latch. */
+    rw_lock_t *m_latch;
+
+   public:
+    void create() {
+      m_latch = static_cast<rw_lock_t *>(ut_zalloc_nokey(sizeof(*m_latch)));
+#ifndef UNIV_LIBRARY
+      rw_lock_create(trx_sys_rw_trx_ids_key, m_latch, SYNC_TRX_SYS_RW_TRX_IDS);
+#endif /* !UNIV_LIBRARY */
+    }
+
+    void destroy() {
+      ut_a(m_ids.empty() && m_trxs.empty());
+#ifndef UNIV_LIBRARY
+      rw_lock_free(m_latch);
+#endif /* !UNIV_LIBRARY */
+      ut_free(m_latch);
+      m_latch = nullptr;
+    }
+
+    void register_trx(trx_t *trx) {
+      rw_lock_x_lock(m_latch);
+      trx->m_rw_trx_ids_slot = m_ids.size();
+      m_ids.emplace_back();
+      m_trxs.push_back(trx);
+      rw_lock_x_unlock(m_latch);
+    }
+
+    void unregister_trx(trx_t *trx) {
+      rw_lock_x_lock(m_latch);
+      const size_t slot = trx->m_rw_trx_ids_slot;
+      ut_ad(slot < m_ids.size() && m_trxs[slot] == trx);
+      /* Shutdown also removes prepared/recovered objects, after all users
+      have stopped. Their slots need not have been cleared by commit. */
+      if (slot + 1 < m_ids.size()) {
+        m_ids[slot] = m_ids.back();
+        m_trxs[slot] = m_trxs.back();
+        m_trxs[slot]->m_rw_trx_ids_slot = slot;
+      }
+      m_ids.pop_back();
+      m_trxs.pop_back();
+      trx->m_rw_trx_ids_slot = std::numeric_limits<size_t>::max();
+      rw_lock_x_unlock(m_latch);
+    }
+
+    template <typename Publish>
+    void publish_id(const trx_t *trx, Publish publish) {
+      rw_lock_s_lock(m_latch);
+      const size_t slot = trx->m_rw_trx_ids_slot;
+      ut_ad(slot < m_ids.size() && m_trxs[slot] == trx);
+      ut_ad(m_ids[slot].id.load(std::memory_order_relaxed) == TRX_ID_MAX);
+      ut_ad(m_ids[slot].no.load(std::memory_order_relaxed) == TRX_ID_MAX);
+      m_ids[slot].id.store(trx->id, std::memory_order_relaxed);
+      publish();
+      rw_lock_s_unlock(m_latch);
+    }
+
+    template <typename Publish>
+    void publish_no(const trx_t *trx, Publish publish) {
+      rw_lock_s_lock(m_latch);
+      const size_t slot = trx->m_rw_trx_ids_slot;
+      ut_ad(slot < m_ids.size() && m_trxs[slot] == trx);
+      ut_ad(m_ids[slot].id.load(std::memory_order_relaxed) == trx->id);
+      ut_ad(m_ids[slot].no.load(std::memory_order_relaxed) == TRX_ID_MAX);
+      /* Order the owning ID before a scanner observes this number. */
+      m_ids[slot].no.store(trx->no, std::memory_order_release);
+      publish();
+      rw_lock_s_unlock(m_latch);
+    }
+
+    void deregister_rw(const trx_t *trx) {
+      rw_lock_x_lock(m_latch);
+      const size_t slot = trx->m_rw_trx_ids_slot;
+      ut_ad(slot < m_ids.size() && m_trxs[slot] == trx);
+      ut_ad(m_ids[slot].id.load(std::memory_order_relaxed) == trx->id);
+      m_ids[slot].id.store(TRX_ID_MAX, std::memory_order_relaxed);
+      /* Observing the reset number must also observe the cleared ID. */
+      m_ids[slot].no.store(TRX_ID_MAX, std::memory_order_release);
+      rw_lock_x_unlock(m_latch);
+    }
+
+    /** A null ids pointer requests only the purge/GTID serialization bound.
+    @return false if the publication bound changed before acquiring the latch */
+    template <typename Validate>
+    bool snapshot_ids(trx_ids_t *ids, trx_id_t max_id, trx_id_t *min_trx_no,
+                      Validate validate) {
+      trx_id_t min_no = max_id;
+      trx_id_t min_id = max_id;
+      rw_lock_s_lock(m_latch);
+      /* Do not combine an earlier ID bound with membership after a newer
+      transaction committed. Never wait for publication while holding the
+      latch: an X waiter could prevent the publisher from acquiring S. */
+      if (!validate()) {
+        rw_lock_s_unlock(m_latch);
+        return false;
+      }
+      if (ids != nullptr) {
+        ids->clear();
+        /* Idle object slots do not predict the number of active IDs.
+        Retain capacity from earlier snapshots and grow only as needed. */
+      }
+      for (const auto &slot : m_ids) {
+        /* A newer number orders the preceding ID publication or reset.
+        An older number only makes the history bound more conservative. */
+        const trx_id_t no = slot.no.load(std::memory_order_acquire);
+        DBUG_EXECUTE_IF("trx_sys_pause_snapshot_no", {
+          if (no < max_id) {
+            DEBUG_SYNC_C("trx_sys_snapshot_no_read");
+          }
+        });
+        const trx_id_t id = slot.id.load(std::memory_order_relaxed);
+        if (id < max_id) {
+          min_id = std::min(min_id, id);
+          if (ids != nullptr) {
+            ids->push_back(id);
+            DEBUG_SYNC_C("trx_sys_snapshot_id_collected");
+          }
+          min_no = std::min(min_no, no);
+        }
+      }
+      rw_lock_s_unlock(m_latch);
+      *min_trx_no = min_no;
+      /* The publication handshake covers all allocations below max_id.
+      Later registrations have IDs >= max_id, including allocations that
+      have not published a slot yet. Thus min_id remains a safe lower bound
+      after releasing the latch. Never let an older scan lower the cache. */
+      trx_id_t previous = m_min_trx_id.load(std::memory_order_relaxed);
+      while (previous < min_id &&
+             !m_min_trx_id.compare_exchange_weak(
+                 previous, min_id, std::memory_order_relaxed)) {
+      }
+      return true;
+    }
+
+    trx_id_t min_trx_id() const {
+      return m_min_trx_id.load(std::memory_order_relaxed);
+    }
+  };
+
+  rw_trx_vector_t m_rw_trx_ids;
+
   /** Allocated objects, including background and recovered transactions.
   Protected by mutex; separate from the MySQL connection list. */
   trx_ut_list_t trx_list;
@@ -749,15 +906,24 @@ public:
   /** Initialize the object registry during single-threaded startup. */
   void init_trx_list() {
     UT_LIST_INIT(trx_list, &trx_t::trx_list);
+    new (&m_rw_trx_ids) rw_trx_vector_t();
+    m_rw_trx_ids.create();
+  }
+
+  void close_trx_list() {
+    m_rw_trx_ids.destroy();
+    m_rw_trx_ids.~rw_trx_vector_t();
   }
 
   void register_trx(trx_t *trx) {
+    m_rw_trx_ids.register_trx(trx);
     mutex_enter(&mutex);
     UT_LIST_ADD_FIRST(trx_list, trx);
     mutex_exit(&mutex);
   }
 
   void unregister_trx(trx_t *trx) {
+    m_rw_trx_ids.unregister_trx(trx);
     mutex_enter(&mutex);
     UT_LIST_REMOVE(trx_list, trx);
     mutex_exit(&mutex);
@@ -833,24 +999,23 @@ public:
   bool found_prepared_trx; /*!< True if XA PREPARED trxs are
                            found. */
 
-  /** Determine if the specified transaction or any older one might
-  be active.
-  @param caller_trx  used to get/set pins
-  @param id          transaction identifier
-  @return whether any transaction not newer than id might be active*/
-  bool find_same_or_older(trx_t *caller_trx, trx_id_t id) {
-    return rw_trx_hash.iterate(caller_trx, find_same_or_older_callback, &id);
-  }
+  /** Conservative lower bound for active transaction IDs. A stale bound
+  only causes an unnecessary clustered-record check, never a missed lock. */
+  trx_id_t get_min_trx_id() const { return m_rw_trx_ids.min_trx_id(); }
 
-  /** Returns the minimum trx->no in hash */
+  /** Returns the minimum published serialization number. */
   trx_id_t get_min_trx_no() {
-    trx_id_t no;
-    while ((no = get_max_trx_id()) != get_rw_trx_hash_version()) {
-      ut_delay(1);
+    for (;;) {
+      trx_id_t no;
+      while ((no = get_max_trx_id()) != get_rw_trx_hash_version()) {
+        ut_delay(1);
+      }
+      trx_id_t min_no;
+      if (m_rw_trx_ids.snapshot_ids(nullptr, no, &min_no,
+                                  [this, no]() { return no == get_max_trx_id(); })) {
+        return min_no;
+      }
     }
-
-    rw_trx_hash.iterate(get_min_trx_no_callback, &no);
-    return no;
   }
 
   /** Determines the maximum transaction id.
@@ -862,7 +1027,7 @@ public:
   /** Allocates and assigns new transaction serialisation number.
 
   There's a gap between m_max_trx_id increment and transaction serialisation
-  number becoming visible through rw_trx_hash. While we're in this gap
+  number becoming visible through the compact slots. While we're in this gap
   concurrent thread may come and do MVCC snapshot without seeing allocated
   but not yet assigned serialisation number. Then at some point purge thread
   may clone this view. As a result it won't see newly allocated serialisation
@@ -872,19 +1037,18 @@ public:
   m_rw_trx_hash_version is intended to solve this problem. MVCC snapshot has
   to wait until m_max_trx_id == m_rw_trx_hash_version, which effectively
   means that all transaction serialisation numbers up to m_max_trx_id are
-  available through rw_trx_hash.
+  available through the compact slots.
 
   We rely on refresh_rw_trx_hash_version() to issue RELEASE memory barrier so
   that m_rw_trx_hash_version increment happens after
-  trx->rw_trx_hash_element->no becomes visible through rw_trx_hash.
+  the slot serialization number becomes visible to snapshot readers.
 
   @param trx transaction */
   bool try_assign_new_trx_no(trx_t *trx) {
     if (!try_get_new_trx_id_no_refresh(&trx->no)) {
       return false;
     }
-    trx->rw_trx_hash_element->no.store(trx->no, std::memory_order_relaxed);
-    refresh_rw_trx_hash_version();
+    m_rw_trx_ids.publish_no(trx, [this]() { refresh_rw_trx_hash_version(); });
     return true;
   }
 
@@ -896,42 +1060,25 @@ public:
   then reserve before startup can discard completed legacy undo. */
   void init_trx_id_reservation();
 
-  /** Takes MVCC snapshot.
-
-  To reduce malloc probablility we reserve rw_trx_hash.size() + 32 elements
-  in ids.
-
-  For details about get_rw_trx_hash_version() != get_max_trx_id() spin
-  @sa register_rw() and @sa try_assign_new_trx_no().
-
-  We rely on get_rw_trx_hash_version() to issue ACQUIRE memory barrier so
-  that loading of m_rw_trx_hash_version happens before accessing rw_trx_hash.
-
-  To optimise snapshot creation rw_trx_hash.iterate() is being used instead
-  of rw_trx_hash.iterate_no_dups(). It means that some transaction
-  identifiers may appear multiple times in ids.
-
-  @param[in,out] caller_trx used to get access to rw_trx_hash_pins
-  @param[out]    ids        array to store registered transaction identifiers
-  @param[out]    max_trx_id variable to store m_max_trx_id value
-  @param[out]    min_trx_no variable to store min(trx->no) value */
-  void snapshot_ids(trx_t *caller_trx, trx_ids_t *ids, trx_id_t *max_trx_id,
+  /** Takes an MVCC snapshot from compact slots after the existing publication
+  barrier. Revalidate the bound under the slot latch so it cannot precede
+  a newly committed transaction while the collected membership follows it.
+  Deregistration is excluded throughout collection. */
+  void snapshot_ids(trx_ids_t *ids, trx_id_t *max_trx_id,
                     trx_id_t *min_trx_no) {
     ut_ad(!mutex_own(&mutex));
-    snapshot_ids_arg arg(ids);
-
-    while ((arg.m_id = get_rw_trx_hash_version()) != get_max_trx_id()) {
-      ut_delay(1);
+    for (;;) {
+      while ((*max_trx_id = get_rw_trx_hash_version()) != get_max_trx_id()) {
+        ut_delay(1);
+      }
+      DEBUG_SYNC_C("trx_sys_snapshot_bound_captured");
+      const trx_id_t max_id = *max_trx_id;
+      if (m_rw_trx_ids.snapshot_ids(
+              ids, max_id, min_trx_no,
+              [this, max_id]() { return max_id == get_max_trx_id(); })) {
+        return;
+      }
     }
-
-    arg.m_no = arg.m_id;
-    ids->clear();
-    ids->reserve(rw_trx_hash.size() + 32);
-
-    rw_trx_hash.iterate(caller_trx, copy_one_id, &arg);
-
-    *max_trx_id = arg.m_id;
-    *min_trx_no = arg.m_no;
   }
 
   void init_max_trx_id(trx_id_t value) {
@@ -944,28 +1091,42 @@ public:
 
   Transaction becomes visible to MVCC.
   There's a gap between m_max_trx_id increment and transaction becoming
-  visible through rw_trx_hash. While we're in this gap concurrent thread may
-  come and do MVCC snapshot. As a result concurrent read view will be able to
-  observe records owned by this transaction even before it was committed.
+  visible through the compact slots. While we're in this gap a concurrent
+  thread may take an MVCC snapshot. The resulting view could observe records
+  owned by this transaction before it commits.
 
   m_rw_trx_hash_version is intended to solve this problem. MVCC snapshot has
   to wait until m_max_trx_id == m_rw_trx_hash_version, which effectively
   means that all transactions up to m_max_trx_id are available through
-  rw_trx_hash.
+  the compact slots.
 
   We rely on refresh_rw_trx_hash_version() to issue RELEASE memory barrier so
   that m_rw_trx_hash_version increment happens after transaction becomes
-  visible through rw_trx_hash. */
+  visible through the compact slots. Hash insertion follows publication,
+  outside the vector latch, so snapshots need not wait for it. Registration
+  still finishes before the caller can write records with the new ID. */
   void register_rw(trx_t *trx) {
+    ut_ad(trx->id == 0);
+    ut_ad(trx->rw_trx_hash_element == nullptr);
     while (!try_get_new_trx_id_no_refresh(&trx->id)) {
       reserve_trx_ids();
     }
+    m_rw_trx_ids.publish_id(trx, [this]() { refresh_rw_trx_hash_version(); });
+    DEBUG_SYNC_C("trx_sys_before_hash_insert");
     rw_trx_hash.insert(trx);
-    refresh_rw_trx_hash_version();
+  }
+
+  /** Restore an existing ID without advancing the allocation/version pair. */
+  void resurrect_rw(trx_t *trx) {
+    rw_trx_hash.insert(trx);
+    m_rw_trx_ids.publish_id(trx, []() {});
+    rw_trx_hash.put_pins(trx);
   }
 
   /** Deregisters read-write transaction. */
   void deregister_rw(trx_t *trx) {
+    DEBUG_SYNC_C("trx_sys_before_slot_clear");
+    m_rw_trx_ids.deregister_rw(trx);
     rw_trx_hash.erase(trx);
   }
 
@@ -975,6 +1136,21 @@ public:
 
   bool is_registered(trx_t *caller_trx, trx_id_t id) {
     return (id > 0 && find(caller_trx, id, false));
+  }
+
+  /** Registration can outlive the implicit-lock release point. Keep the
+  object referenced while testing ACTIVE/PREPARED under its state mutex. */
+  bool is_active(trx_t *caller_trx, trx_id_t id) {
+    trx_t *trx = find(caller_trx, id);
+    if (trx == nullptr) {
+      return false;
+    }
+    trx_mutex_enter(trx);
+    const bool active = trx->state == TRX_STATE_ACTIVE ||
+                        trx->state == TRX_STATE_PREPARED;
+    trx_mutex_exit(trx);
+    trx->release_reference();
+    return active;
   }
 
   /** Clones the oldest view and stores it in view.
@@ -1001,43 +1177,9 @@ public:
   }
 
 private:
-  static bool find_same_or_older_callback(rw_trx_hash_element_t *element,
-                                          trx_id_t *id) {
-    return element->id <= *id;
-  }
-
-  static bool get_min_trx_no_callback(rw_trx_hash_element_t *element,
-                                      trx_id_t *min_no) {
-    trx_id_t no = element->no.load(std::memory_order_relaxed);
-    if (no < *min_no) {
-      *min_no = no;
-    }
-    return false;
-  }
-
-  struct snapshot_ids_arg {
-    snapshot_ids_arg(trx_ids_t *ids): m_ids(ids) {}
-    trx_ids_t *m_ids;
-    trx_id_t m_id;
-    trx_id_t m_no;
-  };
-
   /** Getter for m_rw_trx_hash_version, must issue ACQUIRE memory barrier. */
   trx_id_t get_rw_trx_hash_version() {
     return m_rw_trx_hash_version.load(std::memory_order_acquire);
-  }
-
-  static bool copy_one_id(rw_trx_hash_element_t *element,
-                          snapshot_ids_arg *arg) {
-    if (element->id < arg->m_id) {
-      trx_id_t no = element->no.load(std::memory_order_relaxed);
-      arg->m_ids->push_back(element->id);
-
-      if (no < arg->m_no) {
-        arg->m_no = no;
-      }
-    }
-    return false;
   }
 
   /** Increments m_rw_trx_hash_version, must issue RELEASE memory barrier. */

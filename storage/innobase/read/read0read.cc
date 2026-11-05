@@ -193,10 +193,9 @@ ReadView::~ReadView() {
 }
 
 /** Creates a snapshot where exactly the transactions serialized before
-this point in time are seen in the view.
-@param[in,out] trx transaction */
-inline void ReadViewBase::snapshot(trx_t *trx) {
-  trx_sys->snapshot_ids(trx, &m_ids, &m_low_limit_id, &m_low_limit_no);
+this point in time are seen in the view. */
+inline void ReadViewBase::snapshot() {
+  trx_sys->snapshot_ids(&m_ids, &m_low_limit_id, &m_low_limit_no);
 
   std::sort(m_ids.begin(), m_ids.end());
 
@@ -222,7 +221,7 @@ void ReadView::open(trx_t *trx) {
 
     if (!(trx_is_autocommit_non_locking(trx) && empty() &&
           low_limit_id() == trx_sys->get_max_trx_id())) {
-      snapshot(trx);
+      snapshot();
     }
     m_open.store(true, std::memory_order_relaxed);
 
@@ -236,7 +235,7 @@ No need to call ReadView::close(). The caller owns the view that is passed
 in. This function is called by purge thread to determine whether it should
 purge the delete marked record or not. */
 void trx_sys_t::clone_oldest_view(ReadViewBase *view) const {
-  view->snapshot(nullptr);
+  view->snapshot();
 
   trx_sys_mutex_enter();
   /* Find oldest view. */

@@ -442,6 +442,7 @@ LatchDebug::LatchDebug() {
   LEVEL_MAP_INSERT(SYNC_THREADS);
   LEVEL_MAP_INSERT(SYNC_TRX);
   LEVEL_MAP_INSERT(SYNC_TRX_SYS);
+  LEVEL_MAP_INSERT(SYNC_TRX_SYS_RW_TRX_IDS);
   LEVEL_MAP_INSERT(SYNC_RW_TRX_HASH_ELEMENT);
   LEVEL_MAP_INSERT(SYNC_READ_VIEW);
   LEVEL_MAP_INSERT(SYNC_LOCK_SYS_GLOBAL);
@@ -704,6 +705,7 @@ Latches *LatchDebug::check_order(const latch_t *latch,
     case SYNC_RW_TRX_HASH_ELEMENT:
     case SYNC_READ_VIEW:
     case SYNC_TRX_SYS:
+    case SYNC_TRX_SYS_RW_TRX_IDS:
     case SYNC_IBUF_BITMAP_MUTEX:
     case SYNC_TEMP_SPACE_RSEG:
     case SYNC_UNDO_SPACE_RSEG:
@@ -1491,6 +1493,9 @@ static void sync_latch_meta_init() UNIV_NOTHROW {
                   rw_trx_hash_element_mutex_key);
 
   LATCH_ADD_MUTEX(READ_VIEW_MUTEX, SYNC_READ_VIEW, read_view_mutex_key);
+
+  LATCH_ADD_RWLOCK(TRX_SYS_RW_TRX_IDS, SYNC_TRX_SYS_RW_TRX_IDS,
+                   trx_sys_rw_trx_ids_key);
 
   LATCH_ADD_MUTEX(DBLWR, SYNC_DBLWR, dblwr_mutex_key);
 

@@ -118,9 +118,8 @@ loop:
   }
 
   /** Creates a snapshot where exactly the transactions serialized
-  before this point in time are seen in the view.
-  @param[in,out] trx transaction */
-  inline void snapshot(trx_t *trx);
+  before this point in time are seen in the view. */
+  inline void snapshot();
 
   /** Check whether transaction id is valid.
   @param[in] id transaction id to check

@@ -114,9 +114,11 @@ static bool trx_sys_get_binlog_prepared_callback(
   mutex_enter(&element->mutex);
 
   if (trx_t *trx = element->trx) {
+    trx_mutex_enter(trx);
     if (trx_state_eq(trx, TRX_STATE_PREPARED) && trx_is_mysql_xa(trx)) {
       trx_ids->push_back(trx->id);
     }
+    trx_mutex_exit(trx);
   }
 
   mutex_exit(&element->mutex);
@@ -615,6 +617,7 @@ void trx_sys_close(void) {
   ut_a(trx_sys->trx_list_empty());
 
   trx_sys->rw_trx_hash.destroy();
+  trx_sys->close_trx_list();
 
   /* We used placement new to create this mutex. Call the destructor. */
   mutex_free(&trx_sys->mutex);

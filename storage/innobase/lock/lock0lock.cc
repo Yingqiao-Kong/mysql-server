@@ -864,8 +864,10 @@ static trx_t *lock_sec_rec_some_has_impl(trx_t *caller_trx, const rec_t *rec,
 
   max_trx_id = page_get_max_trx_id(page);
 
-  if ((caller_trx->id > max_trx_id &&
-      !trx_sys->find_same_or_older(caller_trx, max_trx_id)) ||
+  /* The cached bound is conservative and also applies to callers without
+  an RW ID. Page max IDs are not redo logged, so recovery must still inspect
+  the clustered record, as in the original minimum-active-ID check. */
+  if ((max_trx_id < trx_sys->get_min_trx_id() && !recv_recovery_is_on()) ||
       !lock_check_trx_id_sanity(max_trx_id, rec, index, offsets)) {
     return nullptr;
   }

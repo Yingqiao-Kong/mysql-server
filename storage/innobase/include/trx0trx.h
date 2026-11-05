@@ -844,7 +844,7 @@ struct trx_t {
                transaction is moved to
                COMMITTED_IN_MEMORY state.
                Accessed exclusively by trx owner thread.
-               Should be removed in favour of rw_trx_hash_element->no.
+               Published to compact MVCC slots at serialization.
                Initially set to TRX_ID_MAX. */
 
   /** State of the trx from the point of view of concurrency control
@@ -1226,6 +1226,9 @@ struct trx_t {
   }
  private:
   friend struct trx_sys_t;
+  /** Index in trx_sys compact slots; protected by its vector latch.
+  Assigned on every object registration, before it becomes accessible. */
+  size_t m_rw_trx_ids_slot;
   /** Link in the registry of allocated transaction objects. */
   UT_LIST_NODE_T(trx_t) trx_list;
 };

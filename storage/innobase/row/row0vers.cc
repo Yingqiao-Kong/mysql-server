@@ -257,7 +257,7 @@ static bool row_vers_find_matching(trx_t *caller_trx, bool looking_for_match,
     delete-marked, because we never start a transaction by
     inserting a delete-marked record. */
     ut_ad(prev_version || !rec_get_deleted_flag(version, comp) ||
-          !trx_sys->is_registered(caller_trx, trx_id));
+          !trx_sys->is_active(caller_trx, trx_id));
 
     /* Free version and clust_offsets. */
     mem_heap_free(old_heap);
@@ -1392,7 +1392,7 @@ void row_vers_build_for_semi_consistent_read(
       rec_trx_id = version_trx_id;
     }
 
-    if (!trx_sys->is_registered(caller_trx, version_trx_id)) {
+    if (!trx_sys->is_active(caller_trx, version_trx_id)) {
     committed_version_trx:
       /* We found a version that belongs to a
       committed transaction: return it. */
