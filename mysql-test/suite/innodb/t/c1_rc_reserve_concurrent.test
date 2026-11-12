@@ -1,0 +1,69 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--disable_query_log
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+--disable_result_log
+CREATE TABLE w3_visible(id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO w3_visible VALUES(1);
+delimiter |;
+CREATE PROCEDURE w3_burn()
+BEGIN
+  DECLARE n INT DEFAULT 0;
+  WHILE n < 600 DO
+    START TRANSACTION;
+    INSERT INTO w3_temp VALUES(n);
+    COMMIT;
+    SET n=n+1;
+  END WHILE;
+END|
+delimiter ;|
+connect (reserve_a,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+CREATE TEMPORARY TABLE w3_temp(id INT PRIMARY KEY) ENGINE=InnoDB;
+SET DEBUG_SYNC='trx_sys_before_reserve_commit SIGNAL before_commit WAIT_FOR allow_commit TIMEOUT 30 EXECUTE 1';
+SET DEBUG_SYNC='trx_sys_before_reserve_publish SIGNAL before_publish WAIT_FOR allow_publish TIMEOUT 30 EXECUTE 1';
+--send CALL w3_burn();
+connection default;
+SET DEBUG_SYNC='now WAIT_FOR before_commit TIMEOUT 30';
+--enable_result_log
+SHOW WARNINGS;
+--disable_result_log
+# Reservation cannot leave max/version mismatched: an ordinary snapshot works.
+BEGIN;
+--enable_result_log
+SELECT COUNT(*) AS snapshot_during_reservation FROM w3_visible;
+--disable_result_log
+COMMIT;
+SET DEBUG_SYNC='now SIGNAL allow_commit WAIT_FOR before_publish TIMEOUT 30';
+--enable_result_log
+SHOW WARNINGS;
+--disable_result_log
+# A second reserving thread can publish while the first is delayed after WAL.
+CREATE TEMPORARY TABLE w3_other(id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO w3_other VALUES(1);
+SET DEBUG_SYNC='now SIGNAL allow_publish';
+connection reserve_a;
+--reap
+if (`SELECT @@warning_count <> 0`)
+{
+  --die C1 asynchronous statement returned warnings (including possible DEBUG_SYNC timeout)
+}
+--enable_result_log
+SELECT COUNT(*) AS reserved_transactions FROM w3_temp;
+--disable_result_log
+disconnect reserve_a;
+connection default;
+SET DEBUG_SYNC='RESET';
+DROP TEMPORARY TABLE w3_other;
+DROP PROCEDURE w3_burn;
+DROP TABLE w3_visible;
+--enable_query_log
+--enable_result_log

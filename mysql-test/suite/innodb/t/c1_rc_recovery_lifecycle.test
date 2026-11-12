@@ -1,0 +1,123 @@
+# RC adaptation, crash/restart only inside the isolated MTR server.
+--disable_query_log
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+--disable_result_log
+SET SQL_LOG_BIN=0;
+call mtr.add_suppression("Found 1 prepared XA transactions");
+CREATE TABLE maria_life(id INT PRIMARY KEY, k INT, KEY(k)) ENGINE=InnoDB
+ STATS_PERSISTENT=0 STATS_AUTO_RECALC=0;
+CREATE TEMPORARY TABLE maria_burn(id INT PRIMARY KEY) ENGINE=InnoDB;
+--let $n=2048
+while ($n) {
+  eval INSERT INTO maria_burn VALUES($n);
+  --dec $n
+}
+SET cte_max_recursion_depth=6000;
+BEGIN;
+INSERT INTO maria_life WITH RECURSIVE seq(n) AS
+ (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<5000) SELECT n,n FROM seq;
+--sleep 1
+--let $before=`SELECT trx_id FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=CONNECTION_ID()`
+COMMIT;
+FLUSH ENGINE LOGS;
+# Multi-page insert undo has been freed. This normal Debug/Release variant
+# does not isolate GTID as an ID source. Do not claim no-GTID coverage.
+# No later persistent transaction is allowed before the crash.
+--source include/kill_and_restart_mysqld.inc
+--disable_query_log
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+--disable_result_log
+SET SQL_LOG_BIN=0;
+BEGIN;
+INSERT INTO maria_life VALUES(5001,5001);
+--sleep 1
+--let $after=`SELECT trx_id FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=CONNECTION_ID()`
+--exec echo before=$before after=$after > $MYSQLTEST_VARDIR/log/c1_rc_recovery_ids.txt
+--enable_result_log
+eval SELECT CAST('$after' AS UNSIGNED) > CAST('$before' AS UNSIGNED) AS id_after_insert_undo_free;
+SELECT COUNT(*) AS visible_rows FROM maria_life;
+--disable_result_log
+ROLLBACK;
+# Rollback must preserve IDs used on secondary index pages.
+BEGIN;
+UPDATE maria_life SET k=k+10000;
+--sleep 1
+--let $before=`SELECT trx_id FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=CONNECTION_ID()`
+ROLLBACK;
+FLUSH ENGINE LOGS;
+--source include/kill_and_restart_mysqld.inc
+--disable_query_log
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+--disable_result_log
+SET SQL_LOG_BIN=0;
+BEGIN;
+INSERT INTO maria_life VALUES(5001,5001);
+--sleep 1
+--let $after=`SELECT trx_id FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=CONNECTION_ID()`
+--enable_result_log
+eval SELECT CAST('$after' AS UNSIGNED) > CAST('$before' AS UNSIGNED) AS id_after_rollback;
+SELECT MIN(k),MAX(k) FROM maria_life;
+--disable_result_log
+COMMIT;
+XA START 'maria_id_xa';
+UPDATE maria_life SET k=k+10000 WHERE id=1;
+--sleep 1
+--let $before=`SELECT trx_id FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=CONNECTION_ID()`
+XA END 'maria_id_xa';
+XA PREPARE 'maria_id_xa';
+disconnect default;
+connect (default,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+SET SQL_LOG_BIN=0;
+FLUSH ENGINE LOGS;
+--source include/kill_and_restart_mysqld.inc
+--disable_query_log
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+--disable_result_log
+SET SQL_LOG_BIN=0;
+XA COMMIT 'maria_id_xa';
+BEGIN;
+INSERT INTO maria_life VALUES(5002,5002);
+--sleep 1
+--let $after=`SELECT trx_id FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=CONNECTION_ID()`
+COMMIT;
+--enable_result_log
+eval SELECT CAST('$after' AS UNSIGNED) > CAST('$before' AS UNSIGNED) AS id_after_xa_recovery;
+SELECT k FROM maria_life WHERE id=1;
+--disable_result_log
+ALTER TABLE maria_life ADD INDEX k_id(k,id), ALGORITHM=INPLACE;
+ALTER TABLE maria_life FORCE, ALGORITHM=COPY;
+FLUSH ENGINE LOGS;
+--source include/kill_and_restart_mysqld.inc
+--disable_query_log
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+--enable_result_log
+SELECT COUNT(*) AS rows_after_ddl_recovery FROM maria_life;
+--disable_result_log
+DROP TABLE maria_life;
+--enable_query_log
+--enable_result_log

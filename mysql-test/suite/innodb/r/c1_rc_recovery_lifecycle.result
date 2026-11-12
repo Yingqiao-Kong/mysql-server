@@ -1,0 +1,14 @@
+id_after_insert_undo_free
+1
+visible_rows
+5001
+id_after_rollback
+1
+MIN(k)	MAX(k)
+1	5001
+id_after_xa_recovery
+1
+k
+10001
+rows_after_ddl_recovery
+5002

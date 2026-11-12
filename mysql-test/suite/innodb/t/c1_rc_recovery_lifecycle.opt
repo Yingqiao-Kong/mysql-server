@@ -1,0 +1,2 @@
+--transaction-isolation=READ-COMMITTED
+--innodb-flush-log-at-trx-commit=1

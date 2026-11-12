@@ -793,9 +793,32 @@ struct trx_sys_t {
       rw_lock_s_unlock(m_latch);
     }
 
-    template <typename Publish>
-    void publish_no(const trx_t *trx, Publish publish) {
+    /** Acquire the slot latch before opening the allocation/publication gap.
+    A failed allocation must not change the transaction or either counter. */
+    template <typename Allocate, typename Publish>
+    bool try_publish_id(const trx_t *trx, Allocate allocate, Publish publish) {
       rw_lock_s_lock(m_latch);
+      if (!allocate()) {
+        rw_lock_s_unlock(m_latch);
+        return false;
+      }
+      const size_t slot = trx->m_rw_trx_ids_slot;
+      ut_ad(slot < m_ids.size() && m_trxs[slot] == trx);
+      ut_ad(m_ids[slot].id.load(std::memory_order_relaxed) == TRX_ID_MAX);
+      ut_ad(m_ids[slot].no.load(std::memory_order_relaxed) == TRX_ID_MAX);
+      m_ids[slot].id.store(trx->id, std::memory_order_relaxed);
+      publish();
+      rw_lock_s_unlock(m_latch);
+      return true;
+    }
+
+    template <typename Allocate, typename Publish>
+    bool try_publish_no(const trx_t *trx, Allocate allocate, Publish publish) {
+      rw_lock_s_lock(m_latch);
+      if (!allocate()) {
+        rw_lock_s_unlock(m_latch);
+        return false;
+      }
       const size_t slot = trx->m_rw_trx_ids_slot;
       ut_ad(slot < m_ids.size() && m_trxs[slot] == trx);
       ut_ad(m_ids[slot].id.load(std::memory_order_relaxed) == trx->id);
@@ -804,6 +827,7 @@ struct trx_sys_t {
       m_ids[slot].no.store(trx->no, std::memory_order_release);
       publish();
       rw_lock_s_unlock(m_latch);
+      return true;
     }
 
     void deregister_rw(const trx_t *trx) {
@@ -1045,11 +1069,9 @@ public:
 
   @param trx transaction */
   bool try_assign_new_trx_no(trx_t *trx) {
-    if (!try_get_new_trx_id_no_refresh(&trx->no)) {
-      return false;
-    }
-    m_rw_trx_ids.publish_no(trx, [this]() { refresh_rw_trx_hash_version(); });
-    return true;
+    return m_rw_trx_ids.try_publish_no(
+        trx, [this, trx]() { return try_get_new_trx_id_no_refresh(&trx->no); },
+        [this]() { refresh_rw_trx_hash_version(); });
   }
 
   /** Reserve another block before allocating an ID. Caller must not hold
@@ -1108,10 +1130,11 @@ public:
   void register_rw(trx_t *trx) {
     ut_ad(trx->id == 0);
     ut_ad(trx->rw_trx_hash_element == nullptr);
-    while (!try_get_new_trx_id_no_refresh(&trx->id)) {
+    while (!m_rw_trx_ids.try_publish_id(
+        trx, [this, trx]() { return try_get_new_trx_id_no_refresh(&trx->id); },
+        [this]() { refresh_rw_trx_hash_version(); })) {
       reserve_trx_ids();
     }
-    m_rw_trx_ids.publish_id(trx, [this]() { refresh_rw_trx_hash_version(); });
     DEBUG_SYNC_C("trx_sys_before_hash_insert");
     rw_trx_hash.insert(trx);
   }

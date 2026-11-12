@@ -1,0 +1,71 @@
+# RC adaptation for C1; expected result is an assertion, not a recorded pass.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--disable_query_log
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+# The paused view must not make purge block the scheduled commits.
+SET GLOBAL innodb_purge_stop_now=ON;
+CREATE TABLE snapshot_bound (id INT PRIMARY KEY, v INT) ENGINE=InnoDB STATS_PERSISTENT=0;
+INSERT INTO snapshot_bound VALUES (1,0),(2,0);
+--disable_result_log
+connect (writer_a,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+SELECT * FROM snapshot_bound;
+connect (writer_b,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+SELECT * FROM snapshot_bound;
+connect (reader,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+SELECT * FROM snapshot_bound;
+--enable_result_log
+# A exists at the captured bound; B obtains its ID afterwards.
+connection writer_a;
+BEGIN;
+UPDATE snapshot_bound SET v=1 WHERE id=1;
+connection reader;
+SET DEBUG_SYNC='trx_sys_snapshot_bound_captured SIGNAL bounded WAIT_FOR scan TIMEOUT 30 EXECUTE 1';
+BEGIN;
+--send SELECT MAX(IF(id=1,v,NULL)), MAX(IF(id=2,v,NULL)) INTO @x,@y FROM snapshot_bound
+connection default;
+SET DEBUG_SYNC='now WAIT_FOR bounded TIMEOUT 30';
+connection writer_b;
+BEGIN;
+UPDATE snapshot_bound SET v=1 WHERE id=2;
+COMMIT;
+connection writer_a;
+COMMIT;
+connection default;
+SET DEBUG_SYNC='now SIGNAL scan';
+connection reader;
+--reap
+if (`SELECT @@warning_count <> 0`)
+{
+  --die C1 asynchronous statement returned warnings (including possible DEBUG_SYNC timeout)
+}
+# The asynchronous SELECT filled @x/@y; do not open a replacement view.
+# B committed before A: (1,0) cannot be a consistent snapshot.
+SELECT @x AS x, @y AS y, IF(@x<=@y,'consistent','BROKEN') AS snapshot_state;
+COMMIT;
+connection default;
+SET DEBUG_SYNC='RESET';
+disconnect reader;
+disconnect writer_a;
+disconnect writer_b;
+DROP TABLE snapshot_bound;
+SET GLOBAL innodb_purge_run_now=ON;

@@ -1,0 +1,103 @@
+# RC adaptation for C1; expected result is an assertion, not a recorded pass.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+if (`SELECT @@performance_schema = 0`)
+{
+  --skip Requires Performance Schema
+}
+--disable_query_log
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+# Isolate slot exclusion from purge waiting on the deliberately paused view.
+SET GLOBAL innodb_purge_stop_now=ON;
+--let $saved_waits = query_get_value(SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME='events_waits_current', ENABLED, 1)
+--let $saved_latch = query_get_value(SELECT ENABLED FROM performance_schema.setup_instruments WHERE NAME='wait/synch/sxlock/innodb/trx_sys_rw_trx_ids', ENABLED, 1)
+UPDATE performance_schema.setup_consumers SET ENABLED='YES' WHERE NAME='events_waits_current';
+UPDATE performance_schema.setup_instruments SET ENABLED='YES' WHERE NAME='wait/synch/sxlock/innodb/trx_sys_rw_trx_ids';
+--disable_result_log
+SELECT COUNT(*) FROM performance_schema.events_waits_current e JOIN performance_schema.threads t ON e.THREAD_ID=t.THREAD_ID;
+--enable_result_log
+CREATE TABLE snapshot_set (id INT PRIMARY KEY, v INT) ENGINE=InnoDB STATS_PERSISTENT=0;
+INSERT INTO snapshot_set VALUES (1,0),(2,0);
+--disable_result_log
+connect (writer_a,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+SELECT * FROM snapshot_set;
+--let $writer_id = `SELECT CONNECTION_ID()`
+connect (writer_b,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+SELECT * FROM snapshot_set;
+connect (reader,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+SELECT * FROM snapshot_set;
+--enable_result_log
+connection writer_a;
+BEGIN;
+UPDATE snapshot_set SET v=1 WHERE id=1;
+connection writer_b;
+BEGIN;
+UPDATE snapshot_set SET v=1 WHERE id=2;
+connection reader;
+SET DEBUG_SYNC='trx_sys_snapshot_id_collected SIGNAL sampled WAIT_FOR scan TIMEOUT 30 EXECUTE 1';
+BEGIN;
+--send SELECT MAX(IF(id=1,v,NULL)) AS x, MAX(IF(id=2,v,NULL)) AS y FROM snapshot_set
+connection default;
+SET DEBUG_SYNC='now WAIT_FOR sampled TIMEOUT 30';
+connection writer_a;
+SET DEBUG_SYNC='trx_sys_before_slot_clear SIGNAL clearing';
+--send COMMIT
+connection default;
+SET DEBUG_SYNC='now WAIT_FOR clearing TIMEOUT 30';
+# Observe the writer waiting on the latch, rather than relying on a sleep.
+--let $wait_timeout = 10
+--let $wait_condition = SELECT EXISTS(SELECT 1 FROM performance_schema.events_waits_current e JOIN performance_schema.threads t ON e.THREAD_ID=t.THREAD_ID WHERE t.PROCESSLIST_ID=$writer_id AND e.EVENT_NAME='wait/synch/sxlock/innodb/trx_sys_rw_trx_ids' AND e.END_EVENT_ID IS NULL)
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL scan';
+connection reader;
+--reap
+if (`SELECT @@warning_count <> 0`)
+{
+  --die C1 asynchronous statement returned warnings (including possible DEBUG_SYNC timeout)
+}
+# First statement result was returned by reap.
+COMMIT;
+connection writer_a;
+--reap
+if (`SELECT @@warning_count <> 0`)
+{
+  --die C1 asynchronous statement returned warnings (including possible DEBUG_SYNC timeout)
+}
+connection reader;
+BEGIN;
+SELECT MAX(IF(id=1,v,NULL)) AS x, MAX(IF(id=2,v,NULL)) AS y FROM snapshot_set;
+COMMIT;
+connection writer_b;
+COMMIT;
+connection reader;
+BEGIN;
+SELECT MAX(IF(id=1,v,NULL)) AS x, MAX(IF(id=2,v,NULL)) AS y FROM snapshot_set;
+COMMIT;
+connection default;
+SET DEBUG_SYNC='RESET';
+disconnect reader;
+disconnect writer_a;
+disconnect writer_b;
+DROP TABLE snapshot_set;
+--eval UPDATE performance_schema.setup_consumers SET ENABLED='$saved_waits' WHERE NAME='events_waits_current'
+--eval UPDATE performance_schema.setup_instruments SET ENABLED='$saved_latch' WHERE NAME='wait/synch/sxlock/innodb/trx_sys_rw_trx_ids'
+SET GLOBAL innodb_purge_run_now=ON;

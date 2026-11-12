@@ -1,0 +1,7 @@
+Level	Code	Message
+commit_while_serialisation_waits
+1
+completed_before_sync_timeout
+1
+committed_rows
+800

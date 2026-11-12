@@ -1,0 +1,66 @@
+# RC adaptation for C1; expected result is an assertion, not a recorded pass.
+--disable_query_log
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+CREATE TABLE snapshot_race (id INT PRIMARY KEY, v INT) ENGINE=InnoDB STATS_PERSISTENT=0;
+INSERT INTO snapshot_race VALUES (1,0),(2,0);
+connect (writer_a,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+connect (writer_b,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+connect (reader,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+--let $runs=100
+while ($runs)
+{
+  connection default;
+  UPDATE snapshot_race SET v=0;
+  connection writer_a;
+  BEGIN;
+  UPDATE snapshot_race SET v=1 WHERE id=1;
+  connection writer_b;
+  BEGIN;
+  UPDATE snapshot_race SET v=1 WHERE id=2;
+  connection reader;
+  BEGIN;
+  --send SELECT MAX(IF(id=1,v,NULL)), MAX(IF(id=2,v,NULL)) INTO @x,@y FROM snapshot_race
+  connection writer_a;
+  COMMIT;
+  connection writer_b;
+  COMMIT;
+  connection reader;
+  --reap
+if (`SELECT @@warning_count <> 0`)
+{
+  --die C1 asynchronous statement returned warnings (including possible DEBUG_SYNC timeout)
+}
+  --let $bad = query_get_value(SELECT @x < @y AS bad, bad, 1)
+  if ($bad)
+  {
+    SELECT @x, @y;
+    --die Inconsistent transaction snapshot
+  }
+  COMMIT;
+  --dec $runs
+}
+SELECT 'consistent' AS snapshot_state;
+disconnect writer_a;
+disconnect writer_b;
+disconnect reader;
+connection default;
+DROP TABLE snapshot_race;

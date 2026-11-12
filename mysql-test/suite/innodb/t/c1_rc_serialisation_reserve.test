@@ -1,0 +1,79 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--disable_query_log
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+--disable_result_log
+SET SQL_LOG_BIN=0;
+CREATE TABLE w3_queue(id INT PRIMARY KEY) ENGINE=InnoDB;
+CREATE TABLE w3_serial_data(id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO w3_serial_data VALUES(0);
+delimiter |;
+CREATE PROCEDURE w3_serial_burn()
+BEGIN
+  DECLARE n INT DEFAULT 0;
+  WHILE n < 1200 DO
+    START TRANSACTION;
+    UPDATE w3_serial_data SET id=id+1;
+    IF MOD(n,3)=0 THEN
+      ROLLBACK;
+    ELSE
+      COMMIT;
+    END IF;
+    INSERT INTO w3_id_only VALUES(n);
+    # A three-iteration cycle otherwise consumes 8 IDs/nos. Since 256 is
+    # divisible by 8, reservation can repeatedly miss the commit-no path.
+    # One extra ID makes the cycle length 9, visiting every block phase.
+    IF MOD(n,3)=0 THEN
+      INSERT INTO w3_id_only VALUES(1200+n);
+    END IF;
+    SET n=n+1;
+  END WHILE;
+END|
+delimiter ;|
+connect (serial_a,localhost,root,,test);
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+if (`SELECT @@session.transaction_isolation <> 'READ-COMMITTED'`)
+{
+  --die C1 test requires READ COMMITTED in this session
+}
+SET SQL_LOG_BIN=0;
+CREATE TEMPORARY TABLE w3_id_only(id INT PRIMARY KEY) ENGINE=InnoDB;
+SET DEBUG_SYNC='trx_sys_serialisation_reserve SIGNAL serial_wait WAIT_FOR serial_go TIMEOUT 30 EXECUTE 1';
+--send CALL w3_serial_burn();
+connection default;
+SET DEBUG_SYNC='now WAIT_FOR serial_wait TIMEOUT 30';
+--enable_result_log
+SHOW WARNINGS;
+--disable_result_log
+SET @before_other_commit=NOW(6);
+# The failed allocation released pq and left no unpublished version gap.
+INSERT INTO w3_queue VALUES(1);
+UPDATE w3_queue SET id=2 WHERE id=1;
+BEGIN;
+--enable_result_log
+SELECT COUNT(*) AS commit_while_serialisation_waits FROM w3_queue;
+SELECT TIMESTAMPDIFF(SECOND,@before_other_commit,NOW(6)) < 10 AS completed_before_sync_timeout;
+--disable_result_log
+COMMIT;
+SET DEBUG_SYNC='now SIGNAL serial_go';
+connection serial_a;
+--reap
+if (`SELECT @@warning_count <> 0`)
+{
+  --die C1 asynchronous statement returned warnings (including possible DEBUG_SYNC timeout)
+}
+--enable_result_log
+SELECT MAX(id) AS committed_rows FROM w3_serial_data;
+--disable_result_log
+disconnect serial_a;
+connection default;
+SET DEBUG_SYNC='RESET';
+DROP PROCEDURE w3_serial_burn;
+DROP TABLE w3_queue,w3_serial_data;
+SET SQL_LOG_BIN=1;
+--enable_query_log
+--enable_result_log
